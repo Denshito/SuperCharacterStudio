@@ -1,0 +1,12 @@
+{
+  "name": "ta-character-pipeline",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node pipeline.mjs check",
+    "test": "node --test --test-isolation=none pipeline.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

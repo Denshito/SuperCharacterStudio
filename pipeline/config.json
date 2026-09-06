@@ -1,0 +1,44 @@
+{
+  "image_turnaround": {
+    "model": "gpt-image-2-2026-04-21",
+    "preset": "turnaround",
+    "quality": "low",
+    "size": "3072x1024",
+    "background": "opaque",
+    "prompt_extra": ""
+  },
+  "view_split": {
+    "cuts": [0.333333, 0.666667],
+    "order": ["front", "side", "back"]
+  },
+  "generation": {
+    "ai_model": "latest",
+    "pose_mode": "a-pose",
+    "should_texture": true,
+    "enable_pbr": true,
+    "texture_resolution": "2k",
+    "target_formats": ["glb"]
+  },
+  "remesh": {
+    "endpoint": "/openapi/v1/remesh",
+    "topology": "triangle",
+    "target_polycount": 100000,
+    "target_formats": ["glb"]
+  },
+  "rigging": {
+    "height_meters": 1.6
+  },
+  "animation": {
+    "action_id": 0
+  },
+  "normalize": {
+    "height_meters": 1.6,
+    "root_correction_degrees": "0,0,0",
+    "pelvis_correction_degrees": "0,0,0"
+  },
+  "ue_import": {
+    "destination_root": "/Game/Generated"
+  },
+  "pollIntervalSeconds": 5,
+  "timeoutMinutes": 45
+}

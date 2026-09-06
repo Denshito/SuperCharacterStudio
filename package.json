@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "tauri": "tauri",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "check": "npm run prepare:sidecar && tsc --noEmit && cargo check --manifest-path src-tauri/Cargo.toml",
+    "pipeline:test": "node --test --test-isolation=none pipeline/pipeline.test.mjs",
     "build": "tsc && vite build",
+    "verify": "npm run check && npm run pipeline:test && cargo test --manifest-path src-tauri/Cargo.toml && npm run build",
     "bundle": "npm run prepare:sidecar && tauri build"
   },
   "dependencies": {

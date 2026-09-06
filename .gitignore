@@ -5,5 +5,9 @@ src-tauri/binaries/*.exe
 .env
 .env.*
 output/
+pipeline/input/
+pipeline/output/
+*.msi
+*-setup.exe
 *.log
 *.pdb

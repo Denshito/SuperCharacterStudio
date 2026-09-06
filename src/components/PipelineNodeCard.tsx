@@ -10,6 +10,7 @@ export function PipelineNodeCard({ data, selected }: NodeProps<PipelineNode>) {
         <span className="node-status-dot" aria-label={data.status} />
       </div>
       <strong>{data.title}</strong>
+      <em>{data.subtitle}</em>
       <small>{data.status.replace("_", " ")}</small>
       {data.output && <Handle type="source" position={Position.Right} />}
     </article>

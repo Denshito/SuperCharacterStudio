@@ -1,7 +1,10 @@
 import type { Node } from "@xyflow/react";
 
 export type ArtifactKind =
+  | "source-images"
+  | "turnaround-sheet"
   | "image-set"
+  | "approved-image-set"
   | "mesh"
   | "rigged-mesh"
   | "animation"
@@ -29,10 +32,12 @@ export type NodeRunState =
 
 export interface PipelineNodeData extends Record<string, unknown> {
   title: string;
+  subtitle: string;
   category: "Input" | "AI" | "Process" | "DCC" | "Engine";
   description: string;
   status: NodeRunState;
-  input?: ArtifactKind;
+  stageIds: string[];
+  input?: ArtifactKind | ArtifactKind[];
   output?: ArtifactKind;
 }
 
