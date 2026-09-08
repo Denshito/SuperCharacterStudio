@@ -37,7 +37,31 @@
     "pelvis_correction_degrees": "0,0,0"
   },
   "ue_import": {
-    "destination_root": "/Game/Generated"
+    "destination_root": "/Game/Generated",
+    "import_uniform_scale": 100,
+    "two_sided_material": true
+  },
+  "comfy": {
+    "base_url": "http://127.0.0.1:8188",
+    "workflow": "TAOpenRouterTurnaround",
+    "model": "openai/gpt-5.4-image-2",
+    "preset": "turnaround",
+    "timeout_minutes": 20,
+    "poll_interval_seconds": 2,
+    "presets": {
+      "turnaround": {
+        "prompt": "根据参考图生成同一角色的标准三视图角色设定表。从左到右严格排列：正面、右侧面、背面。三个视图必须保持完全一致的角色身份、服装、发型、颜色、材质、身体比例和配饰。全身完整可见，双臂自然略微张开，双腿分开站立，镜头高度和角色尺寸一致。纯色浅灰背景，无文字、无边框、无透视角度、无额外人物。",
+        "quality": "low",
+        "aspect_ratio": "21:9",
+        "background": "opaque"
+      },
+      "style-unify": {
+        "prompt": "统一参考图中角色的画风、材质表现、颜色和光照，并输出从左到右严格排列的正面、右侧面、背面全身三视图。保持角色身份、服装、发型、身体比例和配饰不变。统一站姿、尺寸、镜头高度和浅灰背景，无文字、边框、额外人物或裁切。",
+        "quality": "low",
+        "aspect_ratio": "21:9",
+        "background": "opaque"
+      }
+    }
   },
   "pollIntervalSeconds": 5,
   "timeoutMinutes": 45

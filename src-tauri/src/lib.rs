@@ -1,7 +1,14 @@
+//! Tauri 主进程：负责所有本地信任边界，不实现角色生成业务。
+//!
+//! React 只能使用原生对话框选择文件并持有临时 artifact ID；这里把 ID 映射到
+//! 已规范化的真实路径、管理 Node sidecar 生命周期，并把 JSONL 原样转发给界面。
+//! Manifest 的任务状态仍由 pipeline.mjs 写入，Rust 不维护第二份任务数据库。
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -14,6 +21,7 @@ use tauri_plugin_shell::{
 };
 
 #[derive(Default)]
+// 只保存当前工程批准过的文件；切换工程会整体替换此表，旧 ID 无法继续读取文件。
 struct ProjectSession(Mutex<HashMap<String, PathBuf>>);
 
 #[derive(Default)]
@@ -136,6 +144,59 @@ struct LoadedProject {
     artifacts: Vec<ArtifactInfo>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PortablePackage {
+    format: String,
+    version: u8,
+    run_id: String,
+    manifest: String,
+}
+
+const PACKAGE_FORMAT: &str = "ta-character-studio-project";
+const PROFILE_FORMAT: &str = "ta-character-studio-profile";
+const MAX_PACKAGE_FILES: usize = 10_000;
+const MAX_PACKAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn collect_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| format!("无法读取工程目录：{error}"))? {
+        let path = entry.map_err(|error| format!("无法读取工程文件：{error}"))?.path();
+        if path.is_dir() {
+            collect_files(root, &path, files)?;
+        } else if path.is_file() {
+            let relative = path.strip_prefix(root).map_err(|_| "工程文件不在工程目录中")?;
+            let name = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            files.push((path, name));
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_path(name: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(name);
+    if path.is_absolute() || path.components().any(|part| !matches!(part, Component::Normal(_))) {
+        return Err(format!("工程包包含不安全路径：{name}"));
+    }
+    Ok(path)
+}
+
+fn portable_config(raw: &serde_json::Value) -> serde_json::Value {
+    const KEYS: &[&str] = &["image_turnaround", "view_split", "generation", "remesh", "rigging", "animation", "normalize", "ue_import", "comfy"];
+    let mut result = serde_json::Map::new();
+    if let Some(config) = raw.get("config").and_then(serde_json::Value::as_object) {
+        for key in KEYS {
+            if let Some(value) = config.get(*key) {
+                let mut value = value.clone();
+                if *key == "comfy" {
+                    value.as_object_mut().map(|object| object.remove("base_url"));
+                }
+                result.insert((*key).into(), value);
+            }
+        }
+    }
+    serde_json::Value::Object(result)
+}
+
 fn resolve_listed_path(manifest_path: &Path, listed: &str) -> Result<PathBuf, String> {
     let relative = Path::new(listed);
     if relative.is_absolute()
@@ -162,6 +223,15 @@ fn resolve_listed_path(manifest_path: &Path, listed: &str) -> Result<PathBuf, St
         }
     }
     Err(format!("找不到产物：{listed}"))
+}
+
+// 导入资产的 project.json 清单条目必须是工程内的相对普通路径。
+fn safe_relative_listing(listed: &str) -> bool {
+    let relative = Path::new(listed);
+    !relative.is_absolute()
+        && !relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
 }
 
 fn artifact_info(
@@ -195,6 +265,8 @@ fn artifact_info(
 }
 
 fn load_manifest(path: &Path, session: &ProjectSession) -> Result<LoadedProject, String> {
+    // Manifest 可以列出文件，但不能自行授权任意磁盘路径。只有解析后仍落在允许的
+    // manifest/run/pipeline 根目录且真实存在的文件，才会进入 ProjectSession。
     let text = fs::read_to_string(&path).map_err(|error| format!("无法读取 Manifest：{error}"))?;
     let raw: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
@@ -283,6 +355,196 @@ fn pick_manifest(
     let project = load_manifest(&path, &session)?;
     *selected.0.lock().map_err(|_| "项目会话不可用")? = Some(path);
     Ok(Some(project))
+}
+
+#[tauri::command]
+fn export_project_package(
+    app: tauri::AppHandle,
+    selected: State<SelectedManifest>,
+) -> Result<Option<String>, String> {
+    let manifest_path = selected_manifest(&selected)?;
+    let run_dir = manifest_path.parent().ok_or("Manifest 没有有效目录")?;
+    let raw: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).map_err(|error| format!("无法读取 Manifest：{error}"))?,
+    ).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
+    let run_id = raw.get("runId").and_then(serde_json::Value::as_str).filter(|value| valid_run_name(value)).ok_or("Manifest 缺少有效 runId")?;
+    let Some(target) = app.dialog().file().add_filter("TA Character 工程包", &["zip"]).set_file_name(format!("{run_id}.tacs-project.zip")).blocking_save_file() else {
+        return Ok(None);
+    };
+    let target = target.into_path().map_err(|error| format!("导出路径无效：{error}"))?;
+    if target.starts_with(run_dir) {
+        return Err("工程包不能保存到正在打包的工程目录中".into());
+    }
+
+    let mut files = Vec::new();
+    collect_files(run_dir, run_dir, &mut files)?;
+    if files.len() > MAX_PACKAGE_FILES {
+        return Err("工程文件数量超过安全上限".into());
+    }
+    let archive_file = fs::File::create(&target).map_err(|error| format!("无法创建工程包：{error}"))?;
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let package = PortablePackage {
+        format: PACKAGE_FORMAT.into(),
+        version: 1,
+        run_id: run_id.into(),
+        manifest: format!("output/{run_id}/manifest.json"),
+    };
+    archive.start_file("package.json", options).map_err(|error| format!("无法写入工程包：{error}"))?;
+    archive.write_all(&serde_json::to_vec_pretty(&package).map_err(|error| format!("无法编码工程包信息：{error}"))?).map_err(|error| format!("无法写入工程包信息：{error}"))?;
+    for (path, relative) in files {
+        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_lowercase();
+        if file_name == ".env" || file_name.starts_with(".env.") || file_name.ends_with(".log") { continue; }
+        archive.start_file(format!("output/{run_id}/{relative}"), options).map_err(|error| format!("无法写入工程文件：{error}"))?;
+        let mut source = fs::File::open(&path).map_err(|error| format!("无法读取工程文件：{error}"))?;
+        std::io::copy(&mut source, &mut archive).map_err(|error| format!("无法复制工程文件：{error}"))?;
+    }
+    archive.finish().map_err(|error| format!("无法完成工程包：{error}"))?;
+    Ok(Some(target.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn import_project_package(
+    app: tauri::AppHandle,
+    session: State<ProjectSession>,
+    selected: State<SelectedManifest>,
+) -> Result<Option<LoadedProject>, String> {
+    let Some(source) = app.dialog().file().add_filter("TA Character 工程包", &["zip"]).blocking_pick_file() else {
+        return Ok(None);
+    };
+    let source = source.into_path().map_err(|error| format!("工程包路径无效：{error}"))?;
+    let Some(destination) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let destination = destination.into_path().map_err(|error| format!("导入目录无效：{error}"))?.canonicalize().map_err(|error| format!("无法验证导入目录：{error}"))?;
+    let mut archive = zip::ZipArchive::new(fs::File::open(&source).map_err(|error| format!("无法打开工程包：{error}"))?).map_err(|error| format!("工程包不是有效 ZIP：{error}"))?;
+    if archive.len() > MAX_PACKAGE_FILES {
+        return Err("工程包文件数量超过安全上限".into());
+    }
+    let package: PortablePackage = {
+        let mut entry = archive.by_name("package.json").map_err(|_| "工程包缺少 package.json")?;
+        let mut text = String::new();
+        entry.read_to_string(&mut text).map_err(|error| format!("无法读取工程包信息：{error}"))?;
+        serde_json::from_str(&text).map_err(|error| format!("工程包信息无效：{error}"))?
+    };
+    if package.format != PACKAGE_FORMAT || package.version != 1 || !valid_run_name(&package.run_id) {
+        return Err("不支持的工程包格式或版本".into());
+    }
+    let expected_manifest = format!("output/{}/manifest.json", package.run_id);
+    if package.manifest != expected_manifest {
+        return Err("工程包 Manifest 位置无效".into());
+    }
+    {
+        let mut entry = archive.by_name(&expected_manifest).map_err(|_| "工程包缺少 manifest.json")?;
+        if entry.size() > 16 * 1024 * 1024 { return Err("Manifest 超过安全上限".into()); }
+        let mut text = String::new();
+        entry.read_to_string(&mut text).map_err(|error| format!("无法读取 Manifest：{error}"))?;
+        let manifest: Manifest = serde_json::from_str(&text).map_err(|error| format!("Manifest 结构无效：{error}"))?;
+        if manifest.version != 2 || manifest.run_id != package.run_id { return Err("工程包与 Manifest 的版本或 runId 不一致".into()); }
+    }
+    let prefix = format!("output/{}/", package.run_id);
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| format!("无法检查工程包：{error}"))?;
+        let name = entry.name();
+        validate_archive_path(name)?;
+        if name != "package.json" && !name.starts_with(&prefix) {
+            return Err(format!("工程包包含范围外文件：{name}"));
+        }
+        if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+            return Err("工程包不能包含符号链接".into());
+        }
+        total = total.checked_add(entry.size()).ok_or("工程包大小溢出")?;
+        if total > MAX_PACKAGE_BYTES {
+            return Err("工程包解压后超过 8 GiB 安全上限".into());
+        }
+    }
+    let target_run = destination.join("output").join(&package.run_id);
+    if target_run.exists() {
+        return Err(format!("目标工程已存在：{}", target_run.display()));
+    }
+    fs::create_dir_all(destination.join("output")).map_err(|error| format!("无法创建导入目录：{error}"))?;
+    let output_root = destination.join("output").canonicalize().map_err(|error| format!("无法验证导入目录：{error}"))?;
+    if !output_root.starts_with(&destination) { return Err("导入目录包含指向范围外的链接".into()); }
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| format!("无法读取工程包：{error}"))?;
+        if entry.name() == "package.json" || entry.is_dir() { continue; }
+        let relative = validate_archive_path(entry.name())?;
+        let target = destination.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("无法创建导入目录：{error}"))?;
+            let verified = parent.canonicalize().map_err(|error| format!("无法验证导入目录：{error}"))?;
+            if !verified.starts_with(&output_root) { return Err("工程包试图写入目标工程范围外".into()); }
+        }
+        let mut output = fs::File::create(&target).map_err(|error| format!("无法创建导入文件：{error}"))?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| format!("无法解压工程文件：{error}"))?;
+    }
+    let manifest_path = destination.join(package.manifest);
+    let project = load_manifest(&manifest_path, &session)?;
+    *selected.0.lock().map_err(|_| "项目会话不可用")? = Some(manifest_path);
+    Ok(Some(project))
+}
+
+#[tauri::command]
+fn export_profile(app: tauri::AppHandle, selected: State<SelectedManifest>) -> Result<Option<String>, String> {
+    let path = selected_manifest(&selected)?;
+    let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).map_err(|error| format!("无法读取 Manifest：{error}"))?).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
+    let profile = serde_json::json!({ "format": PROFILE_FORMAT, "version": 1, "config": portable_config(&raw) });
+    let Some(target) = app.dialog().file().add_filter("TA Character 流程配置", &["json"]).set_file_name("TACharacterStudio.tacs-profile.json").blocking_save_file() else { return Ok(None); };
+    let target = target.into_path().map_err(|error| format!("配置路径无效：{error}"))?;
+    fs::write(&target, serde_json::to_vec_pretty(&profile).map_err(|error| format!("无法编码配置：{error}"))?).map_err(|error| format!("无法导出配置：{error}"))?;
+    Ok(Some(target.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn import_profile(app: tauri::AppHandle, selected: State<SelectedManifest>) -> Result<bool, String> {
+    let Some(source) = app.dialog().file().add_filter("TA Character 流程配置", &["json"]).blocking_pick_file() else { return Ok(false); };
+    let source = source.into_path().map_err(|error| format!("配置路径无效：{error}"))?;
+    let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(source).map_err(|error| format!("无法读取配置：{error}"))?).map_err(|error| format!("配置 JSON 已损坏：{error}"))?;
+    if profile.get("format").and_then(serde_json::Value::as_str) != Some(PROFILE_FORMAT) || profile.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("不支持的流程配置格式或版本".into());
+    }
+    let config = profile.get("config").and_then(serde_json::Value::as_object).ok_or("流程配置缺少 config")?;
+    let path = selected_manifest(&selected)?;
+    let mut manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|error| format!("无法读取 Manifest：{error}"))?).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
+    let old_comfy_url = manifest.pointer("/config/comfy/base_url").cloned();
+    manifest["config"] = serde_json::Value::Object(config.clone());
+    if let Some(url) = old_comfy_url { manifest["config"]["comfy"]["base_url"] = url; }
+    if let Some(stages) = manifest.get_mut("stages").and_then(serde_json::Value::as_object_mut) {
+        for (name, stage) in stages {
+            if name != "reference-source" && stage.get("status").and_then(serde_json::Value::as_str) != Some("NOT_STARTED") {
+                stage["status"] = "STALE".into();
+            }
+        }
+    }
+    fs::write(path, serde_json::to_vec_pretty(&manifest).map_err(|error| format!("无法编码 Manifest：{error}"))?).map_err(|error| format!("无法应用流程配置：{error}"))?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn install_comfy_nodes(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let bundled = app.path().resource_dir().map_err(|error| format!("无法定位应用资源：{error}"))?.join("integrations/comfy/ComfyUI-TACharacterTools");
+    #[cfg(debug_assertions)]
+    let source = if bundled.is_dir() { bundled } else { Path::new(env!("CARGO_MANIFEST_DIR")).join("../integrations/comfy/ComfyUI-TACharacterTools") };
+    #[cfg(not(debug_assertions))]
+    let source = bundled;
+    if !source.join("ta_nodes.py").is_file() { return Err("安装包缺少 ComfyUI TA 节点资源".into()); }
+    let Some(folder) = app.dialog().file().blocking_pick_folder() else { return Ok(None); };
+    let custom_nodes = folder.into_path().map_err(|error| format!("ComfyUI 节点目录无效：{error}"))?;
+    if !custom_nodes.is_dir() || custom_nodes.file_name().and_then(|value| value.to_str()).map(|value| !value.eq_ignore_ascii_case("custom_nodes")).unwrap_or(true) {
+        return Err("请选择 ComfyUI 的 custom_nodes 文件夹".into());
+    }
+    let target = custom_nodes.join("ComfyUI-TACharacterTools");
+    fs::create_dir_all(&target).map_err(|error| format!("无法创建节点目录：{error}"))?;
+    let mut files = Vec::new();
+    collect_files(&source, &source, &mut files)?;
+    for (path, relative) in files {
+        if relative.contains("__pycache__") || relative.ends_with(".pyc") { continue; }
+        let destination = target.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|error| format!("无法创建节点子目录：{error}"))?; }
+        fs::copy(path, destination).map_err(|error| format!("无法安装 ComfyUI 节点：{error}"))?;
+    }
+    Ok(Some(target.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -416,20 +678,16 @@ fn load_project_graph(
     let mut artifacts = Vec::new();
     let mut approved = session.0.lock().map_err(|_| "项目会话不可用")?;
     for listed in &graph.imports {
-        let relative = Path::new(listed);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return Err(format!("导入模型路径不安全：{listed}"));
+        if !safe_relative_listing(listed) {
+            return Err(format!("导入资产路径不安全：{listed}"));
         }
+        let relative = Path::new(listed);
         let resolved = run_dir
             .join(relative)
             .canonicalize()
-            .map_err(|_| format!("导入模型已移动或删除：{listed}"))?;
+            .map_err(|_| format!("导入资产已移动或删除：{listed}"))?;
         if !resolved.starts_with(&canonical_run) || !resolved.is_file() {
-            return Err(format!("导入模型不在工程目录内：{listed}"));
+            return Err(format!("导入资产不在工程目录内：{listed}"));
         }
         let id = format!("imported:{listed}");
         approved.insert(id.clone(), resolved.clone());
@@ -568,49 +826,51 @@ fn pick_output_root(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
-#[tauri::command]
-fn import_mesh(
-    app: tauri::AppHandle,
-    session: State<ProjectSession>,
-    selected: State<SelectedManifest>,
+fn import_asset(
+    app: &tauri::AppHandle,
+    session: &State<ProjectSession>,
+    selected: &State<SelectedManifest>,
+    filter_name: &str,
+    extensions: &[&str],
+    fallback_name: &str,
+    error_label: &str,
 ) -> Result<Option<ArtifactInfo>, String> {
     let Some(file) = app
         .dialog()
         .file()
-        .add_filter("GLB 模型", &["glb"])
+        .add_filter(filter_name, extensions)
         .blocking_pick_file()
     else {
         return Ok(None);
     };
     let path = file
         .into_path()
-        .map_err(|error| format!("模型路径无效：{error}"))?
+        .map_err(|error| format!("文件路径无效：{error}"))?
         .canonicalize()
-        .map_err(|error| format!("无法读取模型：{error}"))?;
-    if !path.is_file()
-        || path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| !value.eq_ignore_ascii_case("glb"))
-            .unwrap_or(true)
-    {
-        return Err("请选择有效的 GLB 文件".into());
+        .map_err(|error| format!("无法读取文件：{error}"))?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    if !path.is_file() || !extensions.iter().any(|ext| extension.eq_ignore_ascii_case(ext)) {
+        return Err(error_label.into());
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "系统时间无效")?
         .as_millis();
-    let graph_file = graph_path(&selected)?;
+    let graph_file = graph_path(selected)?;
     let run_dir = graph_file.parent().ok_or("工程目录无效")?;
     let import_dir = run_dir.join("imports");
     fs::create_dir_all(&import_dir).map_err(|error| format!("无法创建导入目录：{error}"))?;
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("model.glb");
+        .unwrap_or(fallback_name);
     let listed = format!("imports/{stamp}-{file_name}");
     let copied = run_dir.join(&listed);
-    fs::copy(&path, &copied).map_err(|error| format!("无法复制模型到工程：{error}"))?;
+    fs::copy(&path, &copied).map_err(|error| format!("无法复制文件到工程：{error}"))?;
     let id = format!("imported:{listed}");
     session
         .0
@@ -626,6 +886,24 @@ fn import_mesh(
         sha256: None,
     };
     Ok(Some(artifact_info(id.clone(), id, &output, Some(&copied))))
+}
+
+#[tauri::command]
+fn import_mesh(
+    app: tauri::AppHandle,
+    session: State<ProjectSession>,
+    selected: State<SelectedManifest>,
+) -> Result<Option<ArtifactInfo>, String> {
+    import_asset(&app, &session, &selected, "GLB 模型", &["glb"], "model.glb", "请选择有效的 GLB 文件")
+}
+
+#[tauri::command]
+fn import_image(
+    app: tauri::AppHandle,
+    session: State<ProjectSession>,
+    selected: State<SelectedManifest>,
+) -> Result<Option<ArtifactInfo>, String> {
+    import_asset(&app, &session, &selected, "角色三视图/参考图", &["png", "jpg", "jpeg"], "turnaround.png", "请选择有效的 PNG 或 JPG 图片")
 }
 
 fn valid_run_name(value: &str) -> bool {
@@ -683,6 +961,16 @@ fn validated_project(value: Option<String>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn command_line_path(path: &Path) -> String {
+    // canonicalize() 在 Windows 上可能产生 \\?\ 前缀；Node/UE 命令行不能可靠识别它。
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
+    }
+}
+
 fn pipeline_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let bundled = app
         .path()
@@ -704,6 +992,16 @@ fn pipeline_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Err("安装包中缺少 pipeline.mjs，请重新安装客户端".into())
 }
 
+fn sidecar_entry(script: &Path) -> Result<(PathBuf, String), String> {
+    let directory = script.parent().ok_or("管线脚本没有有效目录")?.to_path_buf();
+    let file_name = script.file_name().and_then(|value| value.to_str()).ok_or("管线脚本文件名无效")?.to_string();
+    Ok((directory, file_name))
+}
+
+fn is_explicit_spend_confirmation(value: &serde_json::Value) -> bool {
+    value.as_bool() == Some(true)
+}
+
 #[tauri::command]
 fn start_pipeline(
     app: tauri::AppHandle,
@@ -713,7 +1011,7 @@ fn start_pipeline(
     operation: String,
     stage: Option<String>,
     run_name: Option<String>,
-    confirm_spend: bool,
+    confirm_spend: serde_json::Value,
     api_key: Option<String>,
     openai_api_key: Option<String>,
     mock: bool,
@@ -731,26 +1029,44 @@ fn start_pipeline(
     image_quality: Option<String>,
     image_background: Option<String>,
     image_prompt: Option<String>,
+    comfy_url: Option<String>,
+    comfy_preset: Option<String>,
+    comfy_prompt: Option<String>,
 ) -> Result<(), String> {
+    // IPC 中 confirmSpend 是 JSON 值而不是 Rust bool：只接受字面量 true，避免
+    // { value: true } 或字符串 "true" 被误判为付费确认。
+    let confirm_spend = is_explicit_spend_confirmation(&confirm_spend);
     if process.0.lock().map_err(|_| "管线进程不可用")?.is_some() {
         return Err("已有节点正在运行，请先停止或等待完成".into());
     }
-    if !matches!(operation.as_str(), "init" | "execute" | "resume" | "check" | "approve-references") {
+    if !matches!(operation.as_str(), "init" | "execute" | "resume" | "check" | "check-comfy" | "doctor" | "approve-references") {
         return Err("不支持的管线操作".into());
     }
-    if !matches!(operation.as_str(), "check" | "init" | "approve-references")
+    if !matches!(operation.as_str(), "check" | "check-comfy" | "doctor" | "init" | "approve-references")
         && !matches!(
             stage.as_deref(),
-            Some("image-turnaround" | "view-split" | "generation" | "remesh" | "rigging" | "animation" | "normalize" | "ue-import")
+            Some("image-turnaround" | "view-split" | "generation" | "remesh" | "rigging" | "animation" | "normalize" | "ue-import" | "comfy-prep")
         )
     {
-        return Err("请选择可执行的 Meshy 阶段".into());
+        return Err("请选择可执行的管线阶段".into());
     }
 
     let script = pipeline_script(&app)?;
-    let mut args = vec![script.to_string_lossy().into_owned(), operation.clone()];
+    let (script_dir, script_name) = sidecar_entry(&script)?;
+    let mut args = vec![script_name, operation.clone()];
     if operation == "check" {
         args.push("--json".into());
+    } else if operation == "check-comfy" {
+        args.push("--json".into());
+        if let Some(url) = comfy_url.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--comfy-url".into(), url]);
+        }
+    } else if operation == "doctor" {
+        args.push("--json".into());
+        if let Some(url) = comfy_url.filter(|value| !value.trim().is_empty()) { args.extend(["--comfy-url".into(), url]); }
+        if let Some(path) = blender_path.filter(|value| !value.trim().is_empty()) { args.extend(["--tool-path".into(), path]); }
+        if let Some(path) = ue_path.filter(|value| !value.trim().is_empty()) { args.extend(["--ue-path".into(), path]); }
+        if let Some(path) = ue_project.filter(|value| !value.trim().is_empty()) { args.extend(["--ue-project".into(), path]); }
     } else if operation == "init" {
         let name = run_name.ok_or("请输入工程名称")?;
         if !valid_run_name(&name) {
@@ -803,21 +1119,45 @@ fn start_pipeline(
         ]);
         if let Some(id) = input_artifact_id {
             let input = approved_path(&app.state::<ProjectSession>(), &id)?;
-            if input
+            let extension = input
                 .extension()
                 .and_then(|value| value.to_str())
-                .map(|value| !value.eq_ignore_ascii_case("glb"))
-                .unwrap_or(true)
-            {
-                return Err("Remesh/Rigging 的本地输入必须是 GLB".into());
-            }
-            if !matches!(stage_name.as_str(), "remesh" | "rigging") {
-                return Err("只有 Remesh 和 Rigging 可以使用本地 GLB 输入".into());
+                .unwrap_or_default()
+                .to_lowercase();
+            match stage_name.as_str() {
+                "remesh" | "rigging" => {
+                    if extension != "glb" {
+                        return Err("Remesh/Rigging 的本地输入必须是 GLB".into());
+                    }
+                }
+                "view-split" => {
+                    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+                        return Err("视图切分的本地输入必须是 PNG 或 JPG 三视图".into());
+                    }
+                }
+                _ => return Err("该阶段不支持本地输入".into()),
             }
             args.extend([
                 "--input-artifact".into(),
                 input.to_string_lossy().into_owned(),
             ]);
+        }
+        if stage_name == "comfy-prep" {
+            if let Some(url) = comfy_url.filter(|value| !value.trim().is_empty()) {
+                args.extend(["--comfy-url".into(), url]);
+            }
+            if let Some(preset) = comfy_preset.filter(|value| !value.trim().is_empty()) {
+                if !matches!(preset.as_str(), "turnaround" | "style-unify") {
+                    return Err("Comfy 预设无效".into());
+                }
+                args.extend(["--comfy-preset".into(), preset]);
+            }
+            if let Some(prompt) = comfy_prompt.filter(|value| !value.trim().is_empty()) {
+                if prompt.len() > 4000 {
+                    return Err("Comfy 补充提示词不能超过 4000 字符".into());
+                }
+                args.extend(["--comfy-prompt".into(), prompt]);
+            }
         }
         if stage_name == "normalize" {
             let blender = validated_file(blender_path, "D:/Blender/blender.exe", "blender.exe")?;
@@ -827,7 +1167,7 @@ fn start_pipeline(
             }
             args.extend([
                 "--tool-path".into(),
-                blender.to_string_lossy().into_owned(),
+                command_line_path(&blender),
                 "--height".into(),
                 height.to_string(),
                 "--root-correction".into(),
@@ -859,9 +1199,9 @@ fn start_pipeline(
             let project = validated_project(ue_project)?;
             args.extend([
                 "--tool-path".into(),
-                unreal.to_string_lossy().into_owned(),
+                command_line_path(&unreal),
                 "--ue-project".into(),
-                project.to_string_lossy().into_owned(),
+                command_line_path(&project),
             ]);
         }
         if confirm_spend && operation == "execute" {
@@ -876,6 +1216,7 @@ fn start_pipeline(
         .shell()
         .sidecar("node")
         .map_err(|error| format!("无法启动 Node sidecar：{error}"))?
+        .current_dir(script_dir)
         .args(args);
     if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) {
         command = command.env("MESHY_API_KEY", key);
@@ -969,7 +1310,7 @@ fn open_ue_project(
         .map(str::to_string)
         .unwrap_or_else(|| format!("/Game/Generated/{}/PreviewMap", manifest.run_id));
     Command::new(editor)
-        .arg(project)
+        .arg(command_line_path(&project))
         .arg(preview_map)
         .spawn()
         .map_err(|error| format!("无法打开 Unreal 工程：{error}"))?;
@@ -987,6 +1328,11 @@ pub fn run() {
         .manage(PipelineProcess::default())
         .invoke_handler(tauri::generate_handler![
             pick_manifest,
+            export_project_package,
+            import_project_package,
+            export_profile,
+            import_profile,
+            install_comfy_nodes,
             refresh_manifest,
             read_artifact,
             export_artifact,
@@ -994,6 +1340,7 @@ pub fn run() {
             pick_reference,
             pick_output_root,
             import_mesh,
+            import_image,
             load_project_graph,
             save_project_graph,
             set_view_split,
@@ -1037,5 +1384,50 @@ mod tests {
         assert!(!valid_run_name("../角色"));
         assert!(!valid_run_name("bad/name"));
         assert!(!valid_run_name(""));
+    }
+
+    #[test]
+    fn rejects_unsafe_import_listings() {
+        assert!(safe_relative_listing("imports/model.glb"));
+        assert!(safe_relative_listing("imports/turnaround.png"));
+        assert!(!safe_relative_listing("../escape.glb"));
+        assert!(!safe_relative_listing("C:/secret.glb"));
+        assert!(!safe_relative_listing("imports/../escape.glb"));
+    }
+
+    #[test]
+    fn validates_archive_paths_and_portable_config() {
+        assert!(validate_archive_path("output/character/manifest.json").is_ok());
+        assert!(validate_archive_path("../manifest.json").is_err());
+        assert!(validate_archive_path("C:/manifest.json").is_err());
+        let raw = serde_json::json!({ "config": { "generation": { "mode": "multi-image" }, "comfy": { "base_url": "http://127.0.0.1:8188", "preset": "turnaround" }, "secret": "no" } });
+        let config = portable_config(&raw);
+        assert_eq!(config["generation"]["mode"], "multi-image");
+        assert_eq!(config["comfy"]["preset"], "turnaround");
+        assert!(config["comfy"].get("base_url").is_none());
+        assert!(config.get("secret").is_none());
+    }
+
+    #[test]
+    fn sidecar_entry_is_safe_for_drive_and_space_paths() {
+        let (directory, entry) = sidecar_entry(Path::new("E:/TA Character Studio/pipeline/pipeline.mjs")).unwrap();
+        assert_eq!(directory, PathBuf::from("E:/TA Character Studio/pipeline"));
+        assert_eq!(entry, "pipeline.mjs");
+    }
+
+    #[test]
+    fn spend_confirmation_requires_a_json_boolean_true() {
+        assert!(is_explicit_spend_confirmation(&serde_json::json!(true)));
+        assert!(!is_explicit_spend_confirmation(&serde_json::json!(false)));
+        assert!(!is_explicit_spend_confirmation(&serde_json::json!({ "confirmed": true })));
+        assert!(!is_explicit_spend_confirmation(&serde_json::json!("true")));
+        assert!(!is_explicit_spend_confirmation(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefix_for_external_tools() {
+        assert_eq!(command_line_path(Path::new(r"\\?\E:\AIEval\Eval.uproject")), r"E:\AIEval\Eval.uproject");
+        assert_eq!(command_line_path(Path::new(r"\\?\UNC\server\share\Eval.uproject")), r"\\server\share\Eval.uproject");
+        assert_eq!(command_line_path(Path::new(r"E:\AIEval\Eval.uproject")), r"E:\AIEval\Eval.uproject");
     }
 }

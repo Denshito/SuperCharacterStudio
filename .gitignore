@@ -11,3 +11,5 @@ pipeline/output/
 *-setup.exe
 *.log
 *.pdb
+__pycache__/
+*.pyc

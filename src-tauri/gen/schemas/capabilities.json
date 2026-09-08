@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Base permissions for the TA Character Studio window","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"Base permissions for the TA Character Studio window","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-confirm"]}}

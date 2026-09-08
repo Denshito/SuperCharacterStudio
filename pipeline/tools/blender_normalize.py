@@ -1,3 +1,10 @@
+"""Blender 后台规范化与质量审计。
+
+脚本既处理主 Idle 角色，也会被 pipeline.mjs 再次调用来转换 Rigging 附带的
+Walking GLB。输入永不覆盖；所有可交付文件和 validation.json 写到指定输出目录。
+法线策略是 preserve-source：只读检查拓扑，不对 UV/法线接缝拆开的网格岛猜测内外侧。
+"""
+
 import argparse
 import json
 import math
@@ -37,6 +44,45 @@ def bounds(meshes):
     return Vector(map(min, zip(*points))), Vector(map(max, zip(*points)))
 
 
+def audit_and_repair_weights(meshes, armatures, max_influences=4):
+    """把变形权重限制为 UE 常用的 4 影响，并返回修改前发现的问题计数。"""
+    deform_names = {bone.name for armature in armatures for bone in armature.data.bones if bone.use_deform}
+    result = {"vertices": 0, "weightedVertices": 0, "zeroWeightVertices": 0, "nonNormalizedVertices": 0, "overInfluencedVertices": 0, "repairedVertices": 0, "maxInfluences": 0, "unboundMeshObjects": []}
+    if not deform_names:
+        return result
+    for obj in meshes:
+        deform_groups = {group.index: group for group in obj.vertex_groups if group.name in deform_names}
+        if not deform_groups:
+            result["unboundMeshObjects"].append(obj.name)
+            continue
+        for vertex in obj.data.vertices:
+            result["vertices"] += 1
+            weights = [(item.group, item.weight) for item in vertex.groups if item.group in deform_groups and item.weight > 1e-8]
+            result["maxInfluences"] = max(result["maxInfluences"], len(weights))
+            if not weights:
+                result["zeroWeightVertices"] += 1
+                continue
+            result["weightedVertices"] += 1
+            total = sum(weight for _, weight in weights)
+            needs_normalize = abs(total - 1.0) > 0.01
+            needs_limit = len(weights) > max_influences
+            result["nonNormalizedVertices"] += int(needs_normalize)
+            result["overInfluencedVertices"] += int(needs_limit)
+            if not (needs_normalize or needs_limit):
+                continue
+            kept = sorted(weights, key=lambda item: item[1], reverse=True)[:max_influences]
+            kept_ids = {group for group, _ in kept}
+            for group, _ in weights:
+                if group not in kept_ids:
+                    deform_groups[group].remove([vertex.index])
+            kept_total = sum(weight for _, weight in kept)
+            if kept_total > 1e-8:
+                for group, weight in kept:
+                    deform_groups[group].add([vertex.index], weight / kept_total, "REPLACE")
+            result["repairedVertices"] += 1
+    return result
+
+
 def main():
     options = args_after_separator()
     source = Path(options.input).resolve()
@@ -59,7 +105,22 @@ def main():
     if not meshes:
         raise RuntimeError("no mesh objects found")
 
-    minimum, maximum = bounds(meshes)
+    deform_names = {bone.name for armature in armatures for bone in armature.data.bones if bone.use_deform}
+    # 高度必须由真正参与蒙皮的角色网格决定；生成服务可能附带未绑定的 Icosphere 等辅助物。
+    height_meshes = [
+        obj for obj in meshes
+        if obj.find_armature() or any(group.name in deform_names for group in obj.vertex_groups)
+    ] or meshes
+    excluded_meshes = [
+        obj for obj in meshes
+        if obj not in height_meshes and obj.parent is None and not obj.material_slots and not obj.vertex_groups
+    ]
+    excluded_mesh_names = [obj.name for obj in excluded_meshes]
+    for obj in excluded_meshes:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    meshes = [obj for obj in meshes if obj not in excluded_meshes]
+
+    minimum, maximum = bounds(height_meshes)
     source_height = maximum.z - minimum.z
     if source_height <= 1e-6:
         raise RuntimeError("model height is zero")
@@ -68,20 +129,24 @@ def main():
         if obj.parent is None:
             obj.scale *= scale
     bpy.context.view_layer.update()
-    minimum, maximum = bounds(meshes)
+    minimum, maximum = bounds(height_meshes)
     offset = Vector((-(minimum.x + maximum.x) / 2, -(minimum.y + maximum.y) / 2, -minimum.z))
     for obj in bpy.context.scene.objects:
         if obj.parent is None:
             obj.location += offset
 
+    topology_report = {"degenerateFaces": 0, "nonManifoldEdges": 0, "looseVertices": 0}
     for index, obj in enumerate(meshes, 1):
         obj.name = f"CharacterMesh_{index:02d}"
         mesh = obj.data
         mesh.name = f"CharacterMesh_{index:02d}_Geo"
         bm = bmesh.new()
         bm.from_mesh(mesh)
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-        bm.to_mesh(mesh)
+        # 这里故意不调用 recalc_face_normals，也不把 BMesh 写回原网格。Meshy/glTF 在
+        # UV 接缝处可能拆分顶点，全局重算法线会把不连续网格岛错误翻面。
+        topology_report["degenerateFaces"] += sum(1 for face in bm.faces if face.calc_area() < 1e-12)
+        topology_report["nonManifoldEdges"] += sum(1 for edge in bm.edges if not edge.is_manifold)
+        topology_report["looseVertices"] += sum(1 for vertex in bm.verts if not vertex.link_faces)
         bm.free()
         mesh.update()
 
@@ -117,18 +182,32 @@ def main():
             pelvis.rotation_euler.z += pelvis_rotation[2]
             pelvis_applied = True
 
+    weight_report = audit_and_repair_weights(meshes, armatures)
+
     scene = bpy.context.scene
     scene.unit_settings.system = "METRIC"
     scene.unit_settings.scale_length = 1.0
     scene.render.fps = 30
     bpy.context.view_layer.update()
-    minimum, maximum = bounds(meshes)
+    minimum, maximum = bounds(height_meshes)
 
     triangles = sum(len(poly.vertices) - 2 for obj in meshes for poly in obj.data.polygons)
     materials = {slot.material.name for obj in meshes for slot in obj.material_slots if slot.material}
     images = {image.filepath or image.name for image in bpy.data.images}
     actions = list(bpy.data.actions)
     frame_ranges = [action.frame_range[:] for action in actions]
+    loop_mismatch_tracks = sum(
+        1 for action in actions for curve in action.fcurves
+        if len(curve.keyframe_points) > 1 and abs(curve.keyframe_points[0].co.y - curve.keyframe_points[-1].co.y) > 0.001
+    )
+    root_motion_tracks = sum(
+        1 for action in actions for curve in action.fcurves
+        if curve.data_path.endswith("location") and any(name in curve.data_path.lower() for name in ("root", "pelvis", "hips"))
+    )
+    texture_details = [
+        {"name": image.name, "width": image.size[0], "height": image.size[1], "packed": image.packed_file is not None}
+        for image in bpy.data.images if image.type == "IMAGE" and image.size[0] > 0
+    ]
     warnings = []
     if not armatures:
         warnings.append("未检测到骨架")
@@ -140,6 +219,19 @@ def main():
         warnings.append("未检测到纹理图片")
     if any(abs(value) > 1e-8 for value in pelvis_rotation) and not pelvis_applied:
         warnings.append("未找到 Pelvis/Hips 骨骼，未应用骨盆校正")
+
+    if weight_report["zeroWeightVertices"]:
+        warnings.append(f"{weight_report['zeroWeightVertices']} 个顶点没有有效骨骼权重，需要在 Blender 中检查")
+    if weight_report["unboundMeshObjects"]:
+        warnings.append(f"{len(weight_report['unboundMeshObjects'])} 个网格没有变形骨骼组；若为眼睛或附件可忽略，否则需要绑定")
+    if loop_mismatch_tracks:
+        warnings.append(f"{loop_mismatch_tracks} 条动画曲线首尾值不同；循环动画需要美术复核")
+    if topology_report["degenerateFaces"] or topology_report["looseVertices"]:
+        warnings.append(
+            f"网格包含 {topology_report['degenerateFaces']} 个退化面和 {topology_report['looseVertices']} 个孤立顶点"
+        )
+    if excluded_mesh_names:
+        warnings.append(f"已从交付产物排除 {len(excluded_mesh_names)} 个无材质、无权重的辅助网格")
 
     glb_path = output_dir / "normalized-character.glb"
     fbx_path = output_dir / "normalized-character.fbx"
@@ -187,6 +279,13 @@ def main():
             "animations": len(actions),
             "animationTracks": sum(len(action.fcurves) for action in actions),
             "frameRanges": frame_ranges,
+            "weights": weight_report,
+            "topology": topology_report,
+            "normalPolicy": "preserve-source",
+            "excludedMeshObjects": excluded_mesh_names,
+            "rootMotionTracks": root_motion_tracks,
+            "loopMismatchTracks": loop_mismatch_tracks,
+            "textureDetails": texture_details,
         },
         "settings": {
             "targetHeightMeters": options.height,
@@ -195,6 +294,8 @@ def main():
             "forwardAxis": "-Y",
             "upAxis": "Z",
             "unit": "meter",
+            "maxBoneInfluences": 4,
+            "automaticWeightNormalization": True,
         },
         "warnings": warnings,
     }

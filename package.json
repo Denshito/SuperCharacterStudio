@@ -9,12 +9,15 @@
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "check": "npm run prepare:sidecar && tsc --noEmit && cargo check --manifest-path src-tauri/Cargo.toml",
     "pipeline:test": "node --test --test-isolation=none pipeline/pipeline.test.mjs",
+    "comfy:test-transfer": "node scripts/test-comfy-transfer.mjs",
     "build": "tsc && vite build",
     "verify": "npm run check && npm run pipeline:test && cargo test --manifest-path src-tauri/Cargo.toml && npm run build",
-    "bundle": "npm run prepare:sidecar && tauri build"
+    "bundle": "npm run prepare:sidecar && tauri build",
+    "delivery": "powershell -ExecutionPolicy Bypass -File scripts/create-delivery.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
     "@xyflow/react": "^12.11.3",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

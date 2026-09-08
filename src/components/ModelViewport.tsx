@@ -9,6 +9,7 @@ interface PreviewStats { triangles: number; materials: number; textures: number;
 const emptyStats: PreviewStats = { triangles: 0, materials: 0, textures: 0, bones: 0, animations: 0 };
 
 function disposeMaterial(material: THREE.Material) {
+  // Three.js 不会在移除场景对象时自动释放 GPU 纹理与材质。
   for (const value of Object.values(material)) if (value instanceof THREE.Texture) value.dispose();
   material.dispose();
 }
@@ -26,6 +27,8 @@ export function ModelViewport({ artifact, label }: { artifact?: ArtifactInfo; la
   const [time, setTime] = useState(0);
 
   useEffect(() => {
+    // 每个 artifact 拥有独立的 scene/renderer 生命周期。切换 Idle、Walk 或模型阶段时
+    // 完整销毁旧资源，避免反复预览大型 GLB 后显存持续增长。
     const element = host.current;
     if (!element || !artifact?.previewable) return;
     let disposed = false;
@@ -33,7 +36,7 @@ export function ModelViewport({ artifact, label }: { artifact?: ArtifactInfo; la
     let loadedRoot: THREE.Object3D | undefined;
     let skeleton: THREE.SkeletonHelper | undefined;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b111a);
+    scene.background = new THREE.Color(0x25282d);
     const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 1000);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -41,8 +44,8 @@ export function ModelViewport({ artifact, label }: { artifact?: ArtifactInfo; la
     element.appendChild(renderer.domElement);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    const grid = new THREE.GridHelper(10, 20, 0x365070, 0x1b293a);
-    scene.add(grid, new THREE.HemisphereLight(0xffffff, 0x33425a, 2));
+    const grid = new THREE.GridHelper(10, 20, 0x606973, 0x363b42);
+    scene.add(grid, new THREE.HemisphereLight(0xffffff, 0x4b5563, 2));
     const key = new THREE.DirectionalLight(0xffffff, 3);
     key.position.set(4, 7, 5);
     scene.add(key);
@@ -73,6 +76,7 @@ export function ModelViewport({ artifact, label }: { artifact?: ArtifactInfo; la
     setStats(emptyStats);
     invoke<ArrayBuffer | number[]>("read_artifact", { artifactId: artifact.id })
       .then((payload) => {
+        // 前端只提交 artifact ID；实际路径由 Rust 的当前 ProjectSession 决定。
         if (disposed) return;
         const bytes = payload instanceof ArrayBuffer ? payload : new Uint8Array(payload).buffer;
         new GLTFLoader().parse(bytes, "", (gltf) => {
@@ -106,6 +110,7 @@ export function ModelViewport({ artifact, label }: { artifact?: ArtifactInfo; la
           camera.far = size * 100;
           camera.updateProjectionMatrix();
           if (gltf.animations.length) {
+            // 当前产物约定每个 GLB 只交付一个主动作；多动作选择由产物下拉框完成。
             const mixer = new THREE.AnimationMixer(loadedRoot);
             const action = mixer.clipAction(gltf.animations[0]);
             action.play();

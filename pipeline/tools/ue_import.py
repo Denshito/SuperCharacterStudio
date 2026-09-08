@@ -1,3 +1,9 @@
+"""在 Unreal Editor 命令行进程中创建可重复导入的角色预览资产。
+
+主 FBX 提供 Skeletal Mesh、Skeleton 和 Idle；可选 Walk FBX 只作为动画导入并复用
+同一个 Skeleton。目标目录每次重建，因此重复执行不会产生 _2、_3 等资产副本。
+"""
+
 import json
 import os
 import hashlib
@@ -12,6 +18,7 @@ def emit(kind, **payload):
 
 
 def import_task(filename, destination, options):
+    """执行同步 AssetImportTask，并返回 UE 实际创建的对象路径。"""
     task = unreal.AssetImportTask()
     task.filename = filename
     task.destination_path = destination
@@ -30,21 +37,27 @@ def main():
     run_id = os.environ["TA_RUN_ID"]
     report_path = os.environ["TA_UE_REPORT"]
     texture_files = json.loads(os.environ.get("TA_TEXTURES", "[]"))
+    walk_source = os.environ.get("TA_WALK_FBX", "")
+    import_scale = float(os.environ.get("TA_UE_IMPORT_SCALE", "100"))
+    two_sided = os.environ.get("TA_UE_TWO_SIDED", "1") == "1"
     safe_run_id = re.sub(r"[^A-Za-z0-9_-]", "_", run_id).strip("_") or "character"
     if safe_run_id != run_id:
         safe_run_id = f"{safe_run_id}_{hashlib.sha1(run_id.encode('utf-8')).hexdigest()[:8]}"
     destination = f"/Game/Generated/{safe_run_id}"
     emit("stage", stage="ue-import", status="RUNNING", progress=10)
 
+    # 先只导入角色网格和 Skeleton；材质/纹理由脚本创建，避免 FBX 内嵌资源重名。
     mesh_options = unreal.FbxImportUI()
     mesh_options.import_mesh = True
     mesh_options.import_as_skeletal = True
     mesh_options.import_animations = False
-    mesh_options.import_materials = True
-    mesh_options.import_textures = True
+    mesh_options.import_materials = False
+    mesh_options.import_textures = False
     mesh_options.automated_import_should_detect_type = False
     mesh_options.mesh_type_to_import = unreal.FBXImportType.FBXIT_SKELETAL_MESH
+    mesh_options.skeletal_mesh_import_data.import_uniform_scale = import_scale
     mesh_options.skeletal_mesh_import_data.normal_import_method = unreal.FBXNormalImportMethod.FBXNIM_IMPORT_NORMALS_AND_TANGENTS
+    unreal.EditorAssetLibrary.delete_directory(f"{destination}/Character")
     mesh_paths = import_task(source, f"{destination}/Character", mesh_options)
     skeletal_mesh = next((unreal.EditorAssetLibrary.load_asset(path) for path in mesh_paths if isinstance(unreal.EditorAssetLibrary.load_asset(path), unreal.SkeletalMesh)), None)
     if not skeletal_mesh:
@@ -66,6 +79,8 @@ def main():
         )
         sample = unreal.MaterialEditingLibrary.create_material_expression(material, unreal.MaterialExpressionTextureSample, -350, 0)
         sample.texture = texture
+        material.set_editor_property("two_sided", two_sided)
+        material.set_editor_property("used_with_skeletal_mesh", True)
         unreal.MaterialEditingLibrary.connect_material_property(sample, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)
         unreal.MaterialEditingLibrary.recompile_material(material)
         unreal.EditorAssetLibrary.save_loaded_asset(material)
@@ -75,6 +90,7 @@ def main():
             skeletal_mesh.set_editor_property("materials", slots)
         unreal.EditorAssetLibrary.save_loaded_asset(skeletal_mesh)
 
+    # Idle 和 Walk 必须都指向刚创建的 Skeleton，UE 才不会生成重复骨架。
     animation_options = unreal.FbxImportUI()
     animation_options.import_mesh = False
     animation_options.import_animations = True
@@ -84,11 +100,33 @@ def main():
     animation_options.automated_import_should_detect_type = False
     animation_options.original_import_type = unreal.FBXImportType.FBXIT_ANIMATION
     animation_options.mesh_type_to_import = unreal.FBXImportType.FBXIT_ANIMATION
+    animation_options.anim_sequence_import_data.import_uniform_scale = import_scale
+    # Meshy 动画可能以 0.8 等子帧开始；吸附到帧边界可避免 UE 5.4 拒绝导入。
+    animation_options.anim_sequence_import_data.set_editor_property("snap_to_closest_frame_boundary", True)
     unreal.EditorAssetLibrary.delete_directory(f"{destination}/Animation")
     animation_paths = import_task(source, f"{destination}/Animation", animation_options)
     animation = next((unreal.EditorAssetLibrary.load_asset(path) for path in animation_paths if isinstance(unreal.EditorAssetLibrary.load_asset(path), unreal.AnimSequence)), None)
     if not animation:
         raise RuntimeError("UE 未生成 Animation Sequence")
+    idle_path = f"{destination}/Animation/Idle"
+    if unreal.EditorAssetLibrary.does_asset_exist(idle_path):
+        unreal.EditorAssetLibrary.delete_asset(idle_path)
+    if not unreal.EditorAssetLibrary.rename_asset(animation.get_path_name().split(".")[0], idle_path):
+        raise RuntimeError("无法将默认动画命名为 Idle")
+    animation = unreal.EditorAssetLibrary.load_asset(idle_path)
+
+    walk_animation = None
+    if walk_source and os.path.isfile(walk_source):
+        walk_paths = import_task(walk_source, f"{destination}/Animation", animation_options)
+        walk_animation = next((unreal.EditorAssetLibrary.load_asset(path) for path in walk_paths if isinstance(unreal.EditorAssetLibrary.load_asset(path), unreal.AnimSequence)), None)
+        if not walk_animation:
+            raise RuntimeError("UE 未生成 Walk Animation Sequence")
+        walk_path = f"{destination}/Animation/Walk"
+        if unreal.EditorAssetLibrary.does_asset_exist(walk_path):
+            unreal.EditorAssetLibrary.delete_asset(walk_path)
+        if not unreal.EditorAssetLibrary.rename_asset(walk_animation.get_path_name().split(".")[0], walk_path):
+            raise RuntimeError("无法将行走动画命名为 Walk")
+        walk_animation = unreal.EditorAssetLibrary.load_asset(walk_path)
     emit("stage", stage="ue-import", status="RUNNING", progress=70)
 
     map_path = f"{destination}/PreviewMap"
@@ -118,6 +156,7 @@ def main():
     unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)
 
     assets = sorted(unreal.EditorAssetLibrary.list_assets(destination, recursive=True, include_folder=False))
+    mesh_bounds = skeletal_mesh.get_bounds()
     report = {
         "version": 1,
         "status": "PASS",
@@ -126,9 +165,19 @@ def main():
         "skeletalMesh": skeletal_mesh.get_path_name(),
         "skeleton": skeleton.get_path_name(),
         "animation": animation.get_path_name() if animation else None,
+        "animations": {
+            "idle": animation.get_path_name() if animation else None,
+            "walk": walk_animation.get_path_name() if walk_animation else None,
+        },
         "previewMap": map_path,
         "previewActor": actor.get_path_name(),
         "animationPlaying": bool(animation and component),
+        "importUniformScale": import_scale,
+        "twoSidedMaterial": two_sided,
+        "boundsCentimeters": {
+            "size": [mesh_bounds.box_extent.x * 2, mesh_bounds.box_extent.y * 2, mesh_bounds.box_extent.z * 2],
+            "height": mesh_bounds.box_extent.z * 2,
+        },
         "material": material.get_path_name() if material else None,
         "textures": texture_assets,
         "assets": assets,

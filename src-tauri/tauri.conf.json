@@ -31,7 +31,10 @@
       "../pipeline/pipeline.mjs": "pipeline/pipeline.mjs",
       "../pipeline/config.json": "pipeline/config.json",
       "../pipeline/tools/blender_normalize.py": "pipeline/tools/blender_normalize.py",
-      "../pipeline/tools/ue_import.py": "pipeline/tools/ue_import.py"
+      "../pipeline/tools/ue_import.py": "pipeline/tools/ue_import.py",
+      "../integrations/comfy/ComfyUI-TACharacterTools/__init__.py": "integrations/comfy/ComfyUI-TACharacterTools/__init__.py",
+      "../integrations/comfy/ComfyUI-TACharacterTools/ta_nodes.py": "integrations/comfy/ComfyUI-TACharacterTools/ta_nodes.py",
+      "../integrations/comfy/ComfyUI-TACharacterTools/README.md": "integrations/comfy/ComfyUI-TACharacterTools/README.md"
     },
     "icon": [
       "icons/32x32.png",

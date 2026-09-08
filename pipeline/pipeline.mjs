@@ -7,12 +7,23 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { deflateSync, inflateSync } from "node:zlib";
 
+/**
+ * TA Character Studio 的可恢复执行核心。
+ *
+ * 设计约束：
+ * - manifest.json 是任务状态真相；GUI 只能请求操作，不能自行宣布阶段成功。
+ * - 可能产生费用的 POST 必须收到 allowSpend，且网络失败后不自动重发 POST。
+ * - 所有记录到 Manifest 的文件都必须位于 storageRoot 内，并使用相对路径。
+ * - CLI 通过 stdout 输出 JSONL；Tauri 只转发事件，不复制业务状态。
+ */
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const API_BASE = "https://api.meshy.ai";
 const TERMINAL = new Set(["SUCCEEDED", "FAILED", "CANCELED"]);
 const STAGE_NAMES = ["image-turnaround", "generation", "remesh", "rigging", "animation"];
 const LOCAL_STAGE_NAMES = ["normalize", "ue-import"];
 const CHARACTER_STAGES = ["generation", "remesh", "rigging", "animation", "normalize", "ue-import"];
+const COMFY_STAGE = "comfy-prep";
+const COMFY_DEFAULT_URL = "http://127.0.0.1:8188";
 let jsonOutput = false;
 let mockMode = false;
 let mockActiveStage;
@@ -245,6 +256,7 @@ function sleep(milliseconds) {
 }
 
 async function saveManifest(manifestPath, manifest) {
+  // 每个状态转换立即落盘，使关闭 GUI 或停止本地轮询后仍能凭 taskId 恢复。
   manifest.updatedAt = now();
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }
@@ -306,9 +318,12 @@ export function upgradeManifest(manifest, currentConfig) {
     manifest.config.image_turnaround ||= { ...currentConfig.image_turnaround };
     manifest.config.view_split ||= { ...currentConfig.view_split };
     manifest.config.normalize ||= { ...currentConfig.normalize };
-    manifest.config.ue_import ||= { ...currentConfig.ue_import };
+    manifest.config.ue_import = { ...currentConfig.ue_import, ...(manifest.config.ue_import || {}) };
     manifest.stages.normalize ||= newStage("normalize", "local:blender");
     manifest.stages["ue-import"] ||= newStage("ue-import", "local:unreal");
+    manifest.stages[COMFY_STAGE] ||= newStage(COMFY_STAGE, "local:comfy-openrouter");
+    manifest.stages[COMFY_STAGE].endpoint = "local:comfy-openrouter";
+    manifest.config.comfy = { ...DEFAULT_COMFY_SETTINGS, ...(currentConfig.comfy ?? {}), ...(manifest.config.comfy ?? {}), workflow: "TAOpenRouterTurnaround", model: "openai/gpt-5.4-image-2" };
     return manifest;
   };
   if (manifest.stages.remesh) {
@@ -374,6 +389,7 @@ export async function createRunFromReferences(referencePaths, runName, outputRoo
       "image-turnaround": newStage("image-turnaround", "https://api.openai.com/v1/images/edits"),
       "view-split": newStage("view-split", "local:png-split"),
       "reference-approval": newStage("reference-approval", "local:artist-review"),
+      "comfy-prep": newStage("comfy-prep", "local:comfy-openrouter"),
       generation: newStage("generation", "/openapi/v1/multi-image-to-3d"),
       remesh: newStage("remesh", config.remesh.endpoint),
       rigging: newStage("rigging", "/openapi/v1/rigging"),
@@ -412,6 +428,364 @@ const turnaroundPrompts = {
   "clean-pose": "Convert the character references into exactly three aligned full-body orthographic panels left to right: front, right side, back. Preserve design and colors while using a neutral A-pose, even lighting, and a plain background. No text or extra characters.",
 };
 
+// ---------------------------------------------------------------------------
+// Comfy Bridge（7D）：本地 ComfyUI 编排 TAOpenRouterTurnaround 处理参考图。
+// Bridge 目录结构见 PROJECT_STATUS_AND_ROADMAP.md 第 6 节；workflow 不含 API Key
+// 或角色专有绝对路径，回传结果不覆盖原图，失败不污染 Manifest。
+// ---------------------------------------------------------------------------
+
+const DEFAULT_COMFY_SETTINGS = {
+  base_url: COMFY_DEFAULT_URL,
+  workflow: "TAOpenRouterTurnaround",
+  model: "openai/gpt-5.4-image-2",
+  preset: "turnaround",
+  timeout_minutes: 20,
+  poll_interval_seconds: 2,
+};
+
+const DEFAULT_COMFY_PRESETS = {
+  turnaround: {
+    prompt: "根据参考图生成同一角色的标准三视图角色设定表。从左到右严格排列：正面、右侧面、背面。三个视图必须保持完全一致的角色身份、服装、发型、颜色、材质、身体比例和配饰。全身完整可见，双臂自然略微张开，双腿分开站立，镜头高度和角色尺寸一致。纯色浅灰背景，无文字、无边框、无透视角度、无额外人物。",
+    quality: "low",
+    aspect_ratio: "21:9",
+    background: "opaque",
+  },
+  "style-unify": {
+    prompt: "统一参考图中角色的画风、材质表现、颜色和光照，并输出从左到右严格排列的正面、右侧面、背面全身三视图。保持角色身份、服装、发型、身体比例和配饰不变。统一站姿、尺寸、镜头高度和浅灰背景，无文字、边框、额外人物或裁切。",
+    quality: "low",
+    aspect_ratio: "21:9",
+    background: "opaque",
+  },
+};
+
+const REQUIRED_COMFY_NODES = ["TAOpenRouterTurnaround", "LoadImage", "ImageBatch", "SaveImage"];
+
+export function buildComfyWorkflow(inputImages, preset, promptExtra, confirmSpend, jobId) {
+  if (!Array.isArray(inputImages) || inputImages.length < 1 || inputImages.length > 16) throw new Error("Comfy 参考图数量必须为 1 到 16 张。");
+  const workflow = {};
+  let nextId = 1;
+  const loadIds = inputImages.map((image) => {
+    const id = String(nextId++);
+    workflow[id] = { class_type: "LoadImage", inputs: { image } };
+    return id;
+  });
+  let imageLink = [loadIds[0], 0];
+  for (const loadId of loadIds.slice(1)) {
+    const batchId = String(nextId++);
+    workflow[batchId] = { class_type: "ImageBatch", inputs: { image1: imageLink, image2: [loadId, 0] } };
+    imageLink = [batchId, 0];
+  }
+  const taNodeId = String(nextId++);
+  workflow[taNodeId] = {
+    class_type: "TAOpenRouterTurnaround",
+    inputs: {
+      reference_images: imageLink,
+      prompt: `${preset.prompt}${promptExtra ? `\n补充美术要求：${promptExtra}` : ""}`,
+      quality: preset.quality,
+      aspect_ratio: preset.aspect_ratio,
+      background: preset.background,
+      confirm_spend: Boolean(confirmSpend),
+    },
+  };
+  const saveNodeId = String(nextId++);
+  workflow[saveNodeId] = { class_type: "SaveImage", inputs: { images: [taNodeId, 0], filename_prefix: `TACharacterStudio/${jobId}/turnaround` } };
+  return { workflow, taNodeId, saveNodeId };
+}
+
+async function comfyJson(baseUrl, endpoint, { method = "GET", body } = {}) {
+  const url = `${baseUrl}${endpoint}`;
+  const response = await fetch(url, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await response.text();
+  let payload;
+  try { payload = text ? JSON.parse(text) : null; } catch { payload = text; }
+  if (!response.ok) {
+    const detail = payload?.error?.message ?? payload?.message ?? (text || response.statusText);
+    const error = new Error(`ComfyUI ${response.status}: ${detail}`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+async function detectComfy(baseUrl) {
+  try {
+    const [stats, objectInfo] = await Promise.all([
+      comfyJson(baseUrl, "/system_stats"),
+      comfyJson(baseUrl, "/object_info"),
+    ]);
+    const nodes = Object.fromEntries(REQUIRED_COMFY_NODES.map((name) => [name, Boolean(objectInfo?.[name])]));
+    const missingNodes = REQUIRED_COMFY_NODES.filter((name) => !nodes[name]);
+    return { running: true, ready: missingNodes.length === 0, version: stats?.system?.comfyui_version ?? null, devices: stats?.devices ?? null, nodes, missingNodes };
+  } catch (error) {
+    return { running: false, ready: false, error: error.message, nodes: {}, missingNodes: REQUIRED_COMFY_NODES };
+  }
+}
+
+async function uploadComfyImage(baseUrl, filePath, jobId, index) {
+  const extension = path.extname(filePath).toLowerCase();
+  const name = `reference-${index + 1}${extension}`;
+  const subfolder = `TACharacterStudio/${jobId}`;
+  const form = new FormData();
+  form.append("image", new Blob([await fs.readFile(filePath)], { type: mimeFor(filePath) }), name);
+  form.set("type", "input");
+  form.set("subfolder", subfolder);
+  form.set("overwrite", "true");
+  const response = await fetch(`${baseUrl}/upload/image`, { method: "POST", body: form, signal: AbortSignal.timeout(120_000) });
+  const text = await response.text();
+  let payload;
+  try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
+  if (!response.ok || !payload?.name) throw new Error(`上传参考图到 ComfyUI 失败 ${response.status}：${payload?.message ?? text ?? name}`);
+  const returnedFolder = String(payload.subfolder ?? "").replaceAll("\\", "/");
+  if (returnedFolder !== subfolder || path.basename(String(payload.name)) !== payload.name) throw new Error("ComfyUI 返回了不安全的上传路径。");
+  return `${returnedFolder}/${payload.name}`;
+}
+
+async function submitComfyWorkflow(baseUrl, workflowApi, jobId) {
+  const payload = await comfyJson(baseUrl, "/prompt", { method: "POST", body: { prompt: workflowApi, client_id: jobId } });
+  if (!payload?.prompt_id) {
+    const nodeErrors = payload?.node_errors ? ` 节点错误：${JSON.stringify(payload.node_errors)}` : "";
+    throw new Error(`ComfyUI 未返回 prompt_id。${nodeErrors}请检查 TAOpenRouterTurnaround 节点是否已安装并与当前参数兼容。`);
+  }
+  return payload.prompt_id;
+}
+
+async function pollComfyHistory(baseUrl, promptId, timeoutMinutes) {
+  const deadline = Date.now() + timeoutMinutes * 60_000;
+  while (Date.now() < deadline) {
+    const history = await comfyJson(baseUrl, `/history/${promptId}`);
+    const entry = history?.[promptId];
+    if (entry) {
+      if (entry.status?.status_str === "error") {
+        const error = new Error(`ComfyUI 执行失败：${JSON.stringify(entry.status.messages ?? entry.status)}`);
+        error.definitive = true;
+        throw error;
+      }
+      if (entry.outputs) return entry;
+    }
+    await sleep(1000);
+  }
+  const error = new Error(`ComfyUI 超过 ${timeoutMinutes} 分钟未完成；结果状态未知，请先检查 OpenRouter Logs，再决定是否恢复。`);
+  error.resultUnknown = true;
+  throw error;
+}
+
+function collectComfyImages(outputs) {
+  const images = [];
+  for (const nodeOutputs of Object.values(outputs ?? {})) {
+    for (const item of nodeOutputs?.images ?? []) {
+      images.push({ filename: item.filename, subfolder: item.subfolder ?? "", type: item.type ?? "output" });
+    }
+  }
+  if (!images.length) throw new Error("ComfyUI 完成，但响应中没有输出图片。");
+  return images;
+}
+
+function comfyRunMetadata(outputs, taNodeId, fallbackModel) {
+  const nodeOutput = outputs?.[taNodeId] ?? {};
+  const structured = nodeOutput.ta_bridge?.[0];
+  if (structured) {
+    try {
+      const parsed = typeof structured === "string" ? JSON.parse(structured) : structured;
+      return { model: parsed.model ?? fallbackModel, requestId: parsed.request_id ?? null, costUsd: parsed.cost_usd ?? null };
+    } catch { /* fall through to legacy text */ }
+  }
+  const summary = nodeOutput.text?.[0] ?? "";
+  const cost = /费用\s+\$([0-9.]+)/.exec(summary)?.[1];
+  const requestId = /请求\s+(.+)$/.exec(summary)?.[1];
+  return { model: fallbackModel, requestId: requestId && requestId !== "未提供" ? requestId : null, costUsd: cost ? Number(cost) : null };
+}
+
+async function downloadComfyImage(baseUrl, image, destination) {
+  const query = new URLSearchParams({ filename: image.filename, subfolder: image.subfolder, type: image.type });
+  const response = await fetch(`${baseUrl}/view?${query}`, { signal: AbortSignal.timeout(120_000) });
+  if (!response.ok || !response.body) throw new Error(`下载 ComfyUI 输出失败 ${response.status}: ${image.filename}`);
+  await pipeline(response.body, createWriteStream(destination));
+  const stat = await fs.stat(destination);
+  if (stat.size === 0) throw new Error(`ComfyUI 输出为空：${image.filename}`);
+  return { path: destination, bytes: stat.size, sha256: await sha256(destination) };
+}
+
+export async function testComfyTransfer(sourcePath, destination, baseUrl = COMFY_DEFAULT_URL) {
+  const source = path.resolve(sourcePath);
+  await checkedImage(source);
+  const detection = await detectComfy(baseUrl);
+  if (!detection.ready) throw new Error(detection.running ? `ComfyUI 缺少必需节点：${detection.missingNodes.join("、")}` : `未检测到 ComfyUI：${detection.error}`);
+  const jobId = `transfer-${Date.now().toString(36)}`;
+  const uploaded = await uploadComfyImage(baseUrl, source, jobId, 0);
+  const workflow = {
+    "1": { class_type: "LoadImage", inputs: { image: uploaded } },
+    "2": { class_type: "SaveImage", inputs: { images: ["1", 0], filename_prefix: `TACharacterStudio/${jobId}/roundtrip` } },
+  };
+  const promptId = await submitComfyWorkflow(baseUrl, workflow, jobId);
+  const entry = await pollComfyHistory(baseUrl, promptId, 2);
+  const images = collectComfyImages(entry.outputs);
+  await fs.mkdir(path.dirname(path.resolve(destination)), { recursive: true });
+  const downloaded = await downloadComfyImage(baseUrl, images[0], path.resolve(destination));
+  return { jobId, promptId, uploaded, image: images[0], ...downloaded };
+}
+
+export async function validateComfyWorkflowNoSpend(sourcePath, baseUrl = COMFY_DEFAULT_URL) {
+  const source = path.resolve(sourcePath);
+  await checkedImage(source);
+  const detection = await detectComfy(baseUrl);
+  if (!detection.ready) throw new Error(detection.running ? `ComfyUI 缺少必需节点：${detection.missingNodes.join("、")}` : `未检测到 ComfyUI：${detection.error}`);
+  const jobId = `validate-${Date.now().toString(36)}`;
+  const uploaded = await uploadComfyImage(baseUrl, source, jobId, 0);
+  const preset = DEFAULT_COMFY_PRESETS.turnaround;
+  const built = buildComfyWorkflow([uploaded], preset, "", false, jobId);
+  const promptId = await submitComfyWorkflow(baseUrl, built.workflow, jobId);
+  try {
+    await pollComfyHistory(baseUrl, promptId, 2);
+  } catch (error) {
+    if (error.definitive && /未执行付费请求|confirm_spend|未确认/.test(error.message)) return { status: "PASS", jobId, promptId, paidRequestSent: false };
+    throw error;
+  }
+  throw new Error("Comfy 付费门禁验证失败：confirm_spend=false 的工作流不应成功完成。");
+}
+
+function gatherComfyInputs(manifest, storageRoot) {
+  const approved = ["front", "side", "back"].map((name) => manifest.input?.[name]).filter((item) => item?.path);
+  const list = approved.length >= 2 ? approved : (manifest.stages["reference-source"]?.outputs ?? []);
+  if (!list.length) throw new Error("Comfy 参考图准备需要已批准输入或至少一张参考图。");
+  return list.map((item) => absolute(item.path, storageRoot));
+}
+
+async function writeComfyResponse(bridgeDir, { jobId, promptId, images, outputDir, status, metadata }) {
+  const outputs = [];
+  for (const image of images) {
+    const file = path.join(outputDir, image.filename);
+    const stat = await fs.stat(file);
+    outputs.push({ file: image.filename, type: mimeFor(file), bytes: stat.size, sha256: await sha256(file) });
+  }
+  const response = { jobId, workflow: "TAOpenRouterTurnaround", status, promptId: promptId ?? null, metadata: metadata ?? null, outputs, finishedAt: now() };
+  await fs.writeFile(path.join(bridgeDir, "output", "response.json"), `${JSON.stringify(response, null, 2)}\n`, "utf8");
+  return response;
+}
+
+async function validateComfyResponse(bridgeDir, expectedJobId) {
+  const responsePath = path.join(bridgeDir, "output", "response.json");
+  const response = JSON.parse(await fs.readFile(responsePath, "utf8"));
+  if (response.jobId !== expectedJobId) throw new Error(`Comfy 回传 jobId 不匹配：期望 ${expectedJobId}，实际 ${response.jobId}`);
+  if (response.status !== "SUCCEEDED") throw new Error(`Comfy 回传状态异常：${response.status}`);
+  if (!Array.isArray(response.outputs) || !response.outputs.length) throw new Error("Comfy 回传缺少输出。");
+  const first = response.outputs[0];
+  if (mimeFor(first.file) !== "image/png" && mimeFor(first.file) !== "image/jpeg") throw new Error(`Comfy 回传文件类型无效：${first.file}`);
+  const filePath = path.join(bridgeDir, "output", first.file);
+  const hash = await sha256(filePath);
+  if (first.sha256 && hash !== first.sha256) throw new Error(`Comfy 回传哈希校验失败：${first.file}`);
+  return { path: filePath, bytes: first.bytes, sha256: first.sha256, type: first.type };
+}
+
+async function executeComfyPrep(manifest, manifestPath, storageRoot, options = {}) {
+  // OpenRouter Key 由 ComfyUI 进程持有；Studio 只提交不含密钥的工作流。
+  const stage = manifest.stages[COMFY_STAGE];
+  const config = { ...DEFAULT_COMFY_SETTINGS, ...(manifest.config.comfy ?? {}) };
+  const baseUrl = (options.comfyUrl || config.base_url || COMFY_DEFAULT_URL).replace(/\/+$/, "");
+  const presetName = options.preset || config.preset || "turnaround";
+  const preset = { ...(DEFAULT_COMFY_PRESETS[presetName] ?? {}), ...(config.presets?.[presetName] ?? {}) };
+  if (!preset.prompt || !["low", "medium", "high", "auto"].includes(preset.quality) || !preset.aspect_ratio || !["opaque", "auto"].includes(preset.background)) throw new Error(`未知或无效的 Comfy 预设：${presetName}`);
+  const promptExtra = options.promptExtra ?? config.prompt_extra ?? "";
+  const inputs = gatherComfyInputs(manifest, storageRoot);
+  const inputHash = fingerprint({ inputs: await Promise.all(inputs.map(sha256)), presetName, preset, promptExtra });
+  const reusable = stage.inputHash === inputHash && stage.status === "SUCCEEDED" && stage.outputs?.length
+    && (await Promise.all(stage.outputs.map((item) => fs.access(absolute(item.path, storageRoot)).then(() => true).catch(() => false)))).every(Boolean);
+  if (reusable) { emit({ type: "complete", stage: stage.name, status: stage.status, reused: true, progress: 100 }); return stage; }
+  if (options.resumeOnly && (!stage.promptId || !stage.jobId || !stage.bridgeDir)) throw new Error("Comfy 参考图阶段没有可恢复的 prompt ID；请重新执行并确认付费。");
+  if (options.resumeOnly && stage.inputHash !== inputHash) throw new Error("参考图或参数已经变化，不能恢复旧的 Comfy 请求。");
+  if (!options.resumeOnly && !options.allowSpend && !isMock()) {
+    emit({ type: "spend-required", stage: stage.name });
+    throw new Error("即将通过 ComfyUI 创建付费 OpenRouter 图像请求；重新运行并添加 --confirm-spend。");
+  }
+  if (!options.resumeOnly && stage.inputHash && stage.inputHash !== inputHash) stage.previousAttempts = [...(stage.previousAttempts || []), { status: stage.status, inputHash: stage.inputHash, outputs: stage.outputs, replacedAt: now() }];
+
+  const runDir = path.dirname(manifestPath);
+  const jobId = options.resumeOnly ? stage.jobId : `${manifest.runId}-${Date.now().toString(36)}`;
+  const bridgeDir = options.resumeOnly ? absolute(stage.bridgeDir, storageRoot) : path.join(runDir, "bridge", jobId);
+  const inputDir = path.join(bridgeDir, "input");
+  const outputDir = path.join(bridgeDir, "output");
+  await fs.mkdir(inputDir, { recursive: true });
+  await fs.mkdir(outputDir, { recursive: true });
+  let promptId = options.resumeOnly ? stage.promptId : null;
+  let taNodeId = stage.taNodeId ?? null;
+  let saveNodeId = stage.saveNodeId ?? null;
+  if (!options.resumeOnly) Object.assign(stage, { status: "RUNNING", progress: 0, startedAt: now(), inputHash, outputs: [], error: null, resultState: null, promptId: null, jobId, bridgeDir: relative(bridgeDir, storageRoot) });
+  else Object.assign(stage, { status: "RUNNING", error: null, resultState: null });
+  manifest.status = "IN_PROGRESS";
+  await saveManifest(manifestPath, manifest);
+  emit({ type: "stage", stage: stage.name, status: "RUNNING", progress: stage.progress ?? 0 });
+
+  try {
+    let images;
+    let metadata = { model: config.model, requestId: null, costUsd: null };
+    if (isMock()) {
+      const localInputs = inputs.map((file, index) => `TACharacterStudio/${jobId}/reference-${index + 1}${path.extname(file).toLowerCase()}`);
+      const built = buildComfyWorkflow(localInputs, preset, promptExtra, options.allowSpend, jobId);
+      ({ taNodeId, saveNodeId } = built);
+      const request = { jobId, workflow: config.workflow, preset: presetName, promptExtra, inputs: localInputs, baseUrl, createdAt: now() };
+      await fs.writeFile(path.join(bridgeDir, "request.json"), `${JSON.stringify(request, null, 2)}\n`, "utf8");
+      await fs.writeFile(path.join(bridgeDir, "workflow_api.json"), `${JSON.stringify(built.workflow, null, 2)}\n`, "utf8");
+      const width = 96; const height = 32; const rgba = Buffer.alloc(width * height * 4);
+      for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) { const at = (y * width + x) * 4; rgba[at + Math.floor(x / 32)] = 210; rgba[at + 3] = 255; }
+      images = [{ filename: `${jobId}_00001_.png`, subfolder: "", type: "output" }];
+      await fs.writeFile(path.join(outputDir, images[0].filename), encodePng(width, height, rgba));
+    } else {
+      const detection = await detectComfy(baseUrl);
+      if (!detection.running) throw new Error(`未检测到本地 ComfyUI 服务（${baseUrl}）：${detection.error ?? "无法连接"}。请先启动 ComfyUI，或在本会话设置中修改地址。`);
+      if (!detection.ready) throw new Error(`ComfyUI 缺少必需节点：${detection.missingNodes.join("、")}。请安装 TA Character Tools 并重启 ComfyUI。`);
+      if (!options.resumeOnly) {
+        const uploaded = [];
+        for (let index = 0; index < inputs.length; index += 1) {
+          const localName = `reference-${index + 1}${path.extname(inputs[index]).toLowerCase()}`;
+          await fs.copyFile(inputs[index], path.join(inputDir, localName));
+          uploaded.push(await uploadComfyImage(baseUrl, inputs[index], jobId, index));
+        }
+        const built = buildComfyWorkflow(uploaded, preset, promptExtra, true, jobId);
+        ({ taNodeId, saveNodeId } = built);
+        const request = { jobId, workflow: config.workflow, preset: presetName, promptExtra, inputs: uploaded, baseUrl, createdAt: now() };
+        await fs.writeFile(path.join(bridgeDir, "request.json"), `${JSON.stringify(request, null, 2)}\n`, "utf8");
+        await fs.writeFile(path.join(bridgeDir, "workflow_api.json"), `${JSON.stringify(built.workflow, null, 2)}\n`, "utf8");
+        promptId = await submitComfyWorkflow(baseUrl, built.workflow, jobId);
+        Object.assign(stage, { promptId, taNodeId, saveNodeId, jobId });
+        await saveManifest(manifestPath, manifest);
+      }
+      emit({ type: "stage", stage: stage.name, status: "RUNNING", progress: 25, promptId });
+      const entry = await pollComfyHistory(baseUrl, promptId, config.timeout_minutes);
+      const outputs = entry.outputs ?? {};
+      const saveImages = saveNodeId ? outputs[saveNodeId]?.images : null;
+      images = saveImages?.length ? saveImages.map((item) => ({ filename: item.filename, subfolder: item.subfolder ?? "", type: item.type ?? "output" })) : collectComfyImages(outputs);
+      metadata = comfyRunMetadata(outputs, taNodeId, config.model);
+      const localOutput = path.join(outputDir, path.basename(images[0].filename));
+      images[0] = { ...images[0], filename: path.basename(images[0].filename) };
+      await downloadComfyImage(baseUrl, saveImages?.[0] ?? images[0], localOutput);
+    }
+
+    const responseRecord = await writeComfyResponse(bridgeDir, { jobId, promptId, images, outputDir, status: "SUCCEEDED", metadata });
+    const validated = await validateComfyResponse(bridgeDir, jobId);
+    const turnaround = path.join(runDir, COMFY_STAGE, "turnaround.png");
+    await fs.mkdir(path.dirname(turnaround), { recursive: true });
+    await fs.copyFile(validated.path, turnaround);
+    stage.outputs = [await outputRecord(turnaround, storageRoot)];
+    Object.assign(stage, { status: "SUCCEEDED", resultState: "COMPLETED", progress: 100, finishedAt: now(), promptId, taNodeId, saveNodeId, provider: "openrouter", model: metadata.model, requestId: metadata.requestId, usage: { costUsd: metadata.costUsd }, response: responseRecord });
+    delete manifest.lastError;
+    await saveManifest(manifestPath, manifest);
+    emit({ type: "artifact", stage: stage.name, path: stage.outputs[0].path });
+    emit({ type: "complete", stage: stage.name, status: stage.status, progress: 100, costUsd: metadata.costUsd });
+    return stage;
+  } catch (error) {
+    const unknown = Boolean(promptId && !error.definitive);
+    Object.assign(stage, { status: unknown ? "WARNING" : "FAILED", resultState: unknown ? "RESULT_UNKNOWN" : "FAILED", error: error.message, finishedAt: now(), promptId });
+    manifest.status = unknown ? "IN_PROGRESS" : "STOPPED";
+    manifest.lastError = { at: now(), message: error.message };
+    await saveManifest(manifestPath, manifest);
+    throw error;
+  }
+}
+
 async function executeImageTurnaround(manifest, manifestPath, storageRoot, allowSpend) {
   const stage = manifest.stages["image-turnaround"];
   const sources = manifest.stages["reference-source"]?.outputs ?? [];
@@ -445,9 +819,12 @@ async function executeImageTurnaround(manifest, manifestPath, storageRoot, allow
   } catch (error) { Object.assign(stage, { status: "FAILED", error: error.message, requestId: error.requestId ?? null, finishedAt: now() }); manifest.status = "STOPPED"; manifest.lastError = { at: now(), message: error.message }; await saveManifest(manifestPath, manifest); throw error; }
 }
 
-async function executeViewSplit(manifest, manifestPath, storageRoot) {
-  const stage = manifest.stages["view-split"]; const sheet = stageOutput(manifest.stages["image-turnaround"], "turnaround.png", ".png"); if (!sheet) throw new Error("视图切分需要三视图 PNG 输出。");
-  const source = absolute(sheet.path, storageRoot); const config = manifest.config.view_split; const inputHash = fingerprint({ sheet: await sha256(source), config });
+async function executeViewSplit(manifest, manifestPath, storageRoot, inputArtifact) {
+  const stage = manifest.stages["view-split"];
+  const listed = inputArtifact ? null : (stageOutput(manifest.stages["image-turnaround"], "turnaround.png", ".png") ?? stageOutput(manifest.stages[COMFY_STAGE], "turnaround.png", ".png"));
+  if (!inputArtifact && !listed) throw new Error("视图切分需要三视图 PNG 输出（来自生成三视图或 Comfy 参考图准备）。");
+  const source = inputArtifact ? await checkedImage(path.resolve(inputArtifact)) : absolute(listed.path, storageRoot);
+  const config = manifest.config.view_split; const inputHash = fingerprint({ sheet: await sha256(source), config });
   const reusable = stage.inputHash === inputHash && stage.status === "SUCCEEDED" && stage.outputs?.length === 3 && (await Promise.all(stage.outputs.map((item) => fs.access(absolute(item.path, storageRoot)).then(() => true).catch(() => false)))).every(Boolean);
   if (reusable) { emit({ type: "complete", stage: stage.name, status: stage.status, reused: true, progress: 100 }); return stage; }
   if (stage.inputHash && stage.inputHash !== inputHash) stage.previousAttempts = [...(stage.previousAttempts || []), { status: stage.status, inputHash: stage.inputHash, outputs: stage.outputs, replacedAt: now() }];
@@ -457,6 +834,8 @@ async function executeViewSplit(manifest, manifestPath, storageRoot) {
 }
 
 async function ensureStage({ stage, createBody, inputSignature, manifest, manifestPath, runDir, storageRoot, config, allowSpend, resumeOnly = false }) {
+  // 统一付费阶段状态机：签名相同时恢复现有 taskId；签名变化时归档旧尝试；
+  // 没有 allowSpend 时必须在创建任务的 POST 之前停止。
   let task;
   const inputHash = fingerprint(inputSignature);
   if (stage.taskId && stage.inputHash && stage.inputHash !== inputHash) {
@@ -605,6 +984,7 @@ async function runExternal(executable, args, environment = {}) {
 }
 
 async function executeLocalStage(manifestPath, stageName, options) {
+  // Blender/UE 也使用输入签名，因此本地工具与云端阶段遵循同一复用语义。
   const resolvedManifest = path.resolve(manifestPath);
   const manifest = JSON.parse(await fs.readFile(resolvedManifest, "utf8"));
   const currentConfig = JSON.parse(await fs.readFile(path.join(ROOT, "config.json"), "utf8"));
@@ -620,6 +1000,7 @@ async function executeLocalStage(manifestPath, stageName, options) {
   let args;
   let expected;
   let environment = {};
+  let walkGlbSource = "";
 
   if (stageName === "normalize") {
     const script = path.join(ROOT, "tools", "blender_normalize.py");
@@ -630,7 +1011,11 @@ async function executeLocalStage(manifestPath, stageName, options) {
     executable = path.resolve(options.toolPath || "D:/Blender/blender.exe");
     const config = { ...manifest.config.normalize, ...options.normalize };
     manifest.config.normalize = config;
-    signature = { input: await sha256(source), script: await sha256(script), config };
+    const walkOutput = stageOutput(manifest.stages.rigging, "result-basic-animations-walking-glb.glb", ".glb");
+    walkGlbSource = walkOutput ? absolute(walkOutput.path, storageRoot) : "";
+    const hasWalk = walkGlbSource && await fs.access(walkGlbSource).then(() => true).catch(() => false);
+    if (!hasWalk) walkGlbSource = "";
+    signature = { input: await sha256(source), walk: walkGlbSource ? await sha256(walkGlbSource) : null, script: await sha256(script), config };
     args = ["--background", "--factory-startup", "--python", script, "--", "--input", source, "--output-dir", outputDir, "--height", String(config.height_meters), "--root", config.root_correction_degrees, "--pelvis", config.pelvis_correction_degrees];
     expected = ["normalized-character.glb", "normalized-character.fbx", "validation.json"];
   } else {
@@ -638,13 +1023,25 @@ async function executeLocalStage(manifestPath, stageName, options) {
     const input = stageOutput(manifest.stages.normalize, "normalized-character.fbx", ".fbx");
     if (!input) throw new Error("UE Import 需要 Normalize 阶段输出的 FBX。");
     source = absolute(input.path, storageRoot);
+    const walkOutput = stageOutput(manifest.stages.normalize, "normalized-walk.fbx", ".fbx")
+      ?? stageOutput(manifest.stages.rigging, "result-basic-animations-walking-fbx.fbx", ".fbx");
+    const walkSource = walkOutput ? absolute(walkOutput.path, storageRoot) : "";
+    const hasWalk = walkSource && await fs.access(walkSource).then(() => true).catch(() => false);
     executable = path.resolve(options.toolPath || "D:/UE/UE_5.4/Engine/Binaries/Win64/UnrealEditor-Cmd.exe");
     const project = path.resolve(options.ueProject || "E:/AIEval/Eval_Commiting/Eval_Commiting.uproject");
-    signature = { input: await sha256(source), script: await sha256(script), project, config: manifest.config.ue_import };
+    signature = { input: await sha256(source), walk: hasWalk ? await sha256(walkSource) : null, script: await sha256(script), project, config: manifest.config.ue_import };
     const report = path.join(outputDir, "ue-import-report.json");
     args = [project, `-ExecutePythonScript=${script}`, "-unattended", "-nop4", "-nosplash", "-nullrhi"];
     const textures = (manifest.stages.normalize.outputs || []).filter((item) => path.extname(item.path).toLowerCase() === ".png").map((item) => absolute(item.path, storageRoot));
-    environment = { TA_NORMALIZED_FBX: source, TA_RUN_ID: manifest.runId, TA_UE_REPORT: report, TA_TEXTURES: JSON.stringify(textures) };
+    environment = {
+      TA_NORMALIZED_FBX: source,
+      TA_RUN_ID: manifest.runId,
+      TA_UE_REPORT: report,
+      TA_TEXTURES: JSON.stringify(textures),
+      TA_UE_IMPORT_SCALE: String(manifest.config.ue_import.import_uniform_scale ?? 100),
+      TA_UE_TWO_SIDED: manifest.config.ue_import.two_sided_material === false ? "0" : "1",
+      TA_WALK_FBX: hasWalk ? walkSource : "",
+    };
     expected = ["ue-import-report.json"];
   }
   if (!await fs.stat(executable).then((item) => item.isFile()).catch(() => false)) throw new Error(`找不到外部工具：${executable}`);
@@ -665,9 +1062,20 @@ async function executeLocalStage(manifestPath, stageName, options) {
   emit({ type: "stage", stage: stageName, status: "RUNNING", progress: 0 });
   try {
     await runExternal(executable, args, environment);
+    let normalizedWalk = "";
+    if (stageName === "normalize" && walkGlbSource) {
+      // Meshy 的 Walking FBX 缺少 UE 目标骨架所需的根轨道。复用同一 Normalize
+      // 脚本转换 Walking GLB，保证比例、骨骼命名和导出设置与 Idle 一致。
+      const walkDir = path.join(outputDir, "walk");
+      await fs.mkdir(walkDir, { recursive: true });
+      const walkArgs = args.map((item) => item === source ? walkGlbSource : item === outputDir ? walkDir : item);
+      await runExternal(executable, walkArgs, environment);
+      normalizedWalk = path.join(outputDir, "normalized-walk.fbx");
+      await fs.copyFile(path.join(walkDir, "normalized-character.fbx"), normalizedWalk);
+    }
     const reportPath = path.join(outputDir, expected.at(-1));
     const report = JSON.parse(await fs.readFile(reportPath, "utf8"));
-    const files = stageName === "normalize" ? [...report.outputs, reportPath] : [reportPath];
+    const files = stageName === "normalize" ? [...report.outputs, ...(normalizedWalk ? [normalizedWalk] : []), reportPath] : [reportPath];
     stage.outputs = await Promise.all(files.map((file) => outputRecord(path.resolve(file), storageRoot)));
     Object.assign(stage, { status: report.status === "WARNING" ? "WARNING" : "SUCCEEDED", progress: 100, finishedAt: now(), report });
     manifest.status = stageName === "ue-import" && stage.status === "SUCCEEDED" ? "SUCCEEDED" : "IN_PROGRESS";
@@ -684,10 +1092,14 @@ async function executeLocalStage(manifestPath, stageName, options) {
   }
 }
 
-export async function executeStage(manifestPath, stageName, { allowSpend = false, resumeOnly = false, inputArtifact, toolPath, ueProject, normalize, imageTurnaround } = {}) {
+export async function executeStage(manifestPath, stageName, { allowSpend = false, resumeOnly = false, inputArtifact, toolPath, ueProject, normalize, imageTurnaround, comfyUrl, comfyPreset, comfyPrompt } = {}) {
   if (LOCAL_STAGE_NAMES.includes(stageName)) return executeLocalStage(manifestPath, stageName, { toolPath, ueProject, normalize });
+  if (stageName === COMFY_STAGE) {
+    const resolved = path.resolve(manifestPath); const manifest = JSON.parse(await fs.readFile(resolved, "utf8")); const currentConfig = JSON.parse(await fs.readFile(path.join(ROOT, "config.json"), "utf8")); upgradeManifest(manifest, currentConfig);
+    return executeComfyPrep(manifest, resolved, rootForManifest(resolved), { comfyUrl, preset: comfyPreset, promptExtra: comfyPrompt, allowSpend, resumeOnly });
+  }
   if (stageName === "view-split") {
-    const resolved = path.resolve(manifestPath); const manifest = JSON.parse(await fs.readFile(resolved, "utf8")); const currentConfig = JSON.parse(await fs.readFile(path.join(ROOT, "config.json"), "utf8")); upgradeManifest(manifest, currentConfig); return executeViewSplit(manifest, resolved, rootForManifest(resolved));
+    const resolved = path.resolve(manifestPath); const manifest = JSON.parse(await fs.readFile(resolved, "utf8")); const currentConfig = JSON.parse(await fs.readFile(path.join(ROOT, "config.json"), "utf8")); upgradeManifest(manifest, currentConfig); return executeViewSplit(manifest, resolved, rootForManifest(resolved), inputArtifact);
   }
   if (!STAGE_NAMES.includes(stageName)) throw new Error(`未知阶段：${stageName}`);
   mockActiveStage = stageName;
@@ -798,11 +1210,39 @@ async function checkAccess() {
   }
 }
 
+async function diagnoseEnvironment({ comfyUrl, blenderPath, uePath, ueProject }) {
+  const fileCheck = async (id, label, value, expectedName) => {
+    try {
+      const resolved = path.resolve(value);
+      const stat = await fs.stat(resolved);
+      return { id, label, status: stat.isFile() && path.basename(resolved).toLowerCase() === expectedName.toLowerCase() ? "PASS" : "FAIL", message: resolved };
+    } catch (error) {
+      return { id, label, status: "FAIL", message: `${value} (${error.code ?? error.message})` };
+    }
+  };
+  const comfy = await detectComfy((comfyUrl || COMFY_DEFAULT_URL).replace(/\/+$/, ""));
+  const checks = [
+    { id: "node", label: "Node 运行时", status: "PASS", message: `${process.version} · ${process.execPath}` },
+    await fileCheck("pipeline", "内置管线", fileURLToPath(import.meta.url), "pipeline.mjs"),
+    await fileCheck("config", "管线配置", path.join(ROOT, "config.json"), "config.json"),
+    { id: "comfy", label: "ComfyUI 与 TA 节点", status: comfy.ready ? "PASS" : comfy.running ? "WARNING" : "FAIL", message: comfy.ready ? `${comfy.version ?? "unknown"} · ready` : comfy.running ? `缺少节点：${comfy.missingNodes.join("、")}` : (comfy.error ?? "无法连接") },
+    await fileCheck("blender", "Blender", blenderPath || "D:/Blender/blender.exe", "blender.exe"),
+    await fileCheck("unreal", "UnrealEditor-Cmd", uePath || "D:/UE/UE_5.4/Engine/Binaries/Win64/UnrealEditor-Cmd.exe", "UnrealEditor-Cmd.exe"),
+    await fileCheck("uproject", "Unreal 工程", ueProject || "E:/AIEval/Eval_Commiting/Eval_Commiting.uproject", path.basename(ueProject || "Eval_Commiting.uproject")),
+  ];
+  const status = checks.some((item) => item.status === "FAIL") ? "WARNING" : checks.some((item) => item.status === "WARNING") ? "WARNING" : "PASS";
+  emit({ type: "doctor", status, checks }, `环境自检：${status}`);
+  return { status, checks };
+}
+
 function usage() {
   console.log(`用法：
   node pipeline.mjs check
+  node pipeline.mjs check-comfy [--comfy-url http://127.0.0.1:8188] --json
+  node pipeline.mjs doctor [--comfy-url <url>] [--tool-path <blender.exe>] [--ue-path <UnrealEditor-Cmd.exe>] [--ue-project <project.uproject>] --json
   node pipeline.mjs init [--reference <image> ...] --run-name <name> [--output-root <folder>] --json
   node pipeline.mjs execute <stage> --manifest <manifest.json> [--input-artifact <local.glb>] --json [--confirm-spend]
+  node pipeline.mjs execute comfy-prep --manifest <manifest.json> [--comfy-url <url>] [--comfy-preset <preset>] [--comfy-prompt <extra>] --json
   node pipeline.mjs execute normalize --manifest <manifest.json> [--tool-path <blender.exe>] [--height 1.6] --json
   node pipeline.mjs execute ue-import --manifest <manifest.json> --ue-project <project.uproject> [--tool-path <UnrealEditor-Cmd.exe>] --json
   node pipeline.mjs resume <stage> --manifest <manifest.json> --json
@@ -811,7 +1251,7 @@ function usage() {
   node pipeline.mjs run <front.png> <back.png> [run-name] --confirm-spend
   node pipeline.mjs resume <output/.../manifest.json> --confirm-spend
 
-check 只读且不消费 credits；run/resume 只有添加 --confirm-spend 才会创建付费任务。`);
+check/check-comfy 只读且不消费 credits；run/resume 只有添加 --confirm-spend 才会创建付费任务。comfy-prep 由本地 ComfyUI 编排 OpenRouter，执行前同样需要 --confirm-spend。`);
 }
 
 async function main() {
@@ -828,17 +1268,27 @@ async function main() {
   const valueFor = (flag) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined; };
   const toolPath = valueFor("--tool-path");
   const ueProject = valueFor("--ue-project");
+  const uePath = valueFor("--ue-path");
   const height = valueFor("--height");
   const rootCorrection = valueFor("--root-correction");
   const pelvisCorrection = valueFor("--pelvis-correction");
   const imagePreset = valueFor("--image-preset"); const imageQuality = valueFor("--image-quality"); const imageBackground = valueFor("--image-background"); const imagePrompt = valueFor("--image-prompt");
+  const comfyUrl = valueFor("--comfy-url"); const comfyPreset = valueFor("--comfy-preset"); const comfyPrompt = valueFor("--comfy-prompt");
   const runName = valueFor("--run-name"); const front = valueFor("--front"); const side = valueFor("--side"); const back = valueFor("--back");
   const references = args.flatMap((arg, index) => arg === "--reference" && args[index + 1] ? [args[index + 1]] : []);
-  const valuedFlags = ["--manifest", "--output-root", "--input-artifact", "--tool-path", "--ue-project", "--height", "--root-correction", "--pelvis-correction", "--run-name", "--front", "--side", "--back", "--reference", "--image-preset", "--image-quality", "--image-background", "--image-prompt"];
+  const valuedFlags = ["--manifest", "--output-root", "--input-artifact", "--tool-path", "--ue-path", "--ue-project", "--height", "--root-correction", "--pelvis-correction", "--run-name", "--front", "--side", "--back", "--reference", "--image-preset", "--image-quality", "--image-background", "--image-prompt", "--comfy-url", "--comfy-preset", "--comfy-prompt"];
   const flagsWithValues = new Set(valuedFlags.map((flag) => args.indexOf(flag)).filter((index) => index >= 0).map((index) => index + 1));
   const positional = args.filter((arg, index) => !["--confirm-spend", "--json", "--mock", ...valuedFlags].includes(arg) && !flagsWithValues.has(index));
   const [command, ...values] = positional;
   if (command === "check") return checkAccess();
+  if (command === "doctor") return diagnoseEnvironment({ comfyUrl, blenderPath: toolPath, uePath, ueProject });
+  if (command === "check-comfy") {
+    const url = (comfyUrl || COMFY_DEFAULT_URL).replace(/\/+$/, "");
+    const result = await detectComfy(url);
+    emit({ type: "check-comfy", url, ...result }, `${url}: ${result.ready ? `ComfyUI ${result.version ?? ""} 与 TA 节点已就绪` : result.running ? `ComfyUI 已连接，但缺少 ${result.missingNodes.join("、")}` : `未检测到 ComfyUI（${result.error ?? "无法连接"}）`}`);
+    if (!result.ready) process.exitCode = 2;
+    return;
+  }
   if (command === "init" && (references.length || values.length >= 2)) {
     const created = references.length ? await createRunFromReferences(references, runName, outputRoot) : await createRun(values[0], values[1], values[2], outputRoot);
     emit({ type: "initialized", manifest: created }, `已创建：${created}`);
@@ -846,7 +1296,7 @@ async function main() {
   }
   if (command === "inspect" && manifestPath) return inspectManifest(manifestPath);
   if (command === "approve-references" && manifestPath) return approveReferences(manifestPath, { front, side, back });
-  if (command === "execute" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, inputArtifact, toolPath, ueProject, normalize: { ...(height ? { height_meters: Number(height) } : {}), ...(rootCorrection ? { root_correction_degrees: rootCorrection } : {}), ...(pelvisCorrection ? { pelvis_correction_degrees: pelvisCorrection } : {}) }, imageTurnaround: { ...(imagePreset ? { preset: imagePreset } : {}), ...(imageQuality ? { quality: imageQuality } : {}), ...(imageBackground ? { background: imageBackground } : {}), ...(imagePrompt !== undefined ? { prompt_extra: imagePrompt } : {}) } });
+  if (command === "execute" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, inputArtifact, toolPath, ueProject, normalize: { ...(height ? { height_meters: Number(height) } : {}), ...(rootCorrection ? { root_correction_degrees: rootCorrection } : {}), ...(pelvisCorrection ? { pelvis_correction_degrees: pelvisCorrection } : {}) }, imageTurnaround: { ...(imagePreset ? { preset: imagePreset } : {}), ...(imageQuality ? { quality: imageQuality } : {}), ...(imageBackground ? { background: imageBackground } : {}), ...(imagePrompt !== undefined ? { prompt_extra: imagePrompt } : {}) }, comfyUrl, comfyPreset, comfyPrompt });
   if (command === "resume" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, resumeOnly: true, inputArtifact });
   if (command === "run" && values.length >= 2) {
     const manifestPath = await createRun(values[0], values[1], values[2]);

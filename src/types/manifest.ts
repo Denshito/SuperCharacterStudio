@@ -24,6 +24,7 @@ export interface ManifestV2 {
   [key: string]: unknown;
 }
 export interface ArtifactInfo {
+  /** Rust 会话生成的授权 ID；不能由文件路径推导或伪造。 */
   id: string;
   stage: string;
   fileName: string;
@@ -47,6 +48,7 @@ export function toRunState(value?: string): NodeRunState {
   return states.includes(normalized) ? normalized : "NOT_STARTED";
 }
 export function parseManifestV2(value: unknown): ManifestV2 {
+  // 前端检查负责给出易懂错误；Rust 后端仍会独立解析并执行路径安全检查。
   if (!value || typeof value !== "object") throw new Error("Manifest 不是有效对象");
   const candidate = value as Partial<ManifestV2>;
   if (candidate.version !== 2) throw new Error(`仅支持 v2 Manifest，当前版本为 ${String(candidate.version ?? "未知")}`);
@@ -60,6 +62,7 @@ export function parseManifestV2(value: unknown): ManifestV2 {
 }
 const severity: Record<NodeRunState, number> = { NOT_STARTED: 0, SUCCEEDED: 1, RUNNING: 2, WARNING: 3, STALE: 3, FAILED: 4 };
 export function combinedState(stageIds: string[], manifest?: ManifestV2): NodeRunState {
+  // 聚合节点展示最需要用户关注的子阶段，而不是简单采用最后一个阶段。
   return stageIds.map((id) => toRunState(manifest?.stages[id]?.status))
     .reduce((worst, state) => severity[state] > severity[worst] ? state : worst, "NOT_STARTED");
 }
