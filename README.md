@@ -2,7 +2,7 @@
 
 面向角色技术美术测试和小型生产流程的节点式桌面工具。项目以美术人员易用性为优先：简单模式展示制作步骤，高级模式暴露真实阶段、中间产物、任务状态与可重连端口。
 
-当前源码已覆盖参考图处理、Comfy/OpenRouter 桥接、Meshy 建模、减面、绑定、Idle/Walk 动画、Blender 规范化与质量审计、Unreal Engine 自动导入，以及工程包/流程配置迁移。剩余工作主要是第二角色泛化、动画/纹理美术精修和最终打包。图形界面不是状态真相来源；每次运行的 `manifest.json` 保存阶段状态、输入哈希、任务 ID、费用、错误和产物哈希。
+1.0.0 源码已覆盖参考图处理、Comfy/OpenRouter 桥接、Meshy 建模、减面、绑定、Idle/Walk 动画、Blender 规范化与质量审计、无 Blender 兼容导入、Unreal Engine 自动导入，以及工程包/流程配置迁移。安装包和精简交付目录可由仓库脚本重建；剩余工作主要是第二角色泛化与动画/纹理美术精修。图形界面不是状态真相来源；每次运行的 `manifest.json` 保存阶段状态、输入哈希、任务 ID、费用、错误和产物哈希。
 
 ## 30 秒理解工程
 
@@ -112,6 +112,7 @@ TACharacterStudio/
 - Normalize 统一米制单位、角色高度、原点、轴向、对象命名和 FBX 平滑信息，并把 Meshy 已有的 24 根人形骨骼改为 UE 常用核心命名；不新增 Root、Twist、IK 或手指骨骼。它保留来源面绕序与自定义法线，不再对拆分网格岛执行破坏性的全模型法线重算。
 - Root/Pelvis 校正为可配置参数，不写死当前角色。
 - Normalize 会把 Rigging 返回的 Walking GLB 独立转换为 `normalized-walk.fbx`；该文件与主角色使用同一规格且不会触发 Meshy 请求。
+- 没有 Blender 时可显式选择“无 Blender，跳过质检”。Studio 会改用 Meshy 原始 FBX 继续导入 UE，并把 Normalize、UE Import 和项目状态标记为 `SKIPPED/WARNING`；不会伪装成质量检查通过。
 - UE Import 使用 `/Game/Generated/<runId>/` 稳定路径创建或更新 Skeletal Mesh、Skeleton、Idle、Walk、材质、纹理和 Preview Map；Idle 与 Walk 复用同一个 Skeleton。
 - 重复导入不创建 `_2`、`_3` 资产副本。
 - Normalize 同时检查并规范化骨骼权重和（容差 0.01）、限制每顶点最多 4 个骨骼影响，并报告未绑定网格、Root/Pelvis 位移轨道、循环首尾差异与贴图分辨率；源资产不会被覆盖。
@@ -128,18 +129,19 @@ TACharacterStudio/
 |---|---|---|
 | 客户端源码 | TypeScript 类型检查、Cargo check | PASS |
 | 生产构建 | `npm run verify`（含 Vite production build，205 模块） | PASS；仅有主 JS chunk 大小提示 |
-| Rust 安全边界 | 9 项测试：文件授权、路径与工程包安全、付费布尔值、sidecar/Windows 路径 | PASS |
-| 管线 Mock | 23 项测试：参考图门禁、PNG 切分、付费阻断、路径越界、断点复用、Remesh 与 Comfy Bridge | PASS |
+| Rust 安全边界 | 10 项测试：文件授权、路径与工程包安全、付费布尔值、sidecar/Windows 路径 | PASS |
+| 管线 Mock | 24 项测试：参考图门禁、PNG 切分、付费阻断、路径越界、断点复用、Remesh、Comfy Bridge 与无 Blender 回退 | PASS |
 | 管线 Mock（含 Comfy Bridge） | 覆盖付费阻断、节点检测、上传、动态工作流、回传校验、切分链和失败状态 | PASS |
 | Meshy 实际任务 | Generation 30、Remesh 5、Rigging 5、Animation 3 credits | PASS |
 | Blender Normalize | `Testing_2`：1.6 m、103,197 三角面、24 骨骼、0 退化面、0 孤立点、来源法线保留；另输出规范化 Walk | PASS（27 条循环曲线需美术复核） |
 | UE 5.4 Import | `Testing_2`：138.58 cm、7 个稳定资产、同 Skeleton 的 Idle/Walk、双面材质、Preview Map | PASS |
+| 无 Blender UE 5.4 Import | 隔离运行：raw 模式、160.00 cm、Idle/Walk、材质与 2 张纹理、9 个资产、Preview Map | WARNING（兼容链路 PASS，质量审计未运行） |
 | GPT Image 2 直连实际调用 | Mock 已通过；尚未使用 OpenAI 直连账户执行 Low 质量请求 | 待验证（不影响已验证的 OpenRouter 路径） |
 | Comfy Bridge 实际调用 | ComfyUI 0.33.4；真实上传/下载/切分 PASS；一次 Low 请求成功，费用 `$0.0099` | PASS |
 | 当前角色 UE 视觉检查 | 比例与法线已由用户在 UE 确认通过 | PASS |
 | 最终动画/纹理验收 | 肩、胯、膝、脚底、循环、衣物穿插和纹理细节仍需人工检查 | 待确认 |
 
-以上最新角色证据来自本机 `Testing_2` 运行；生成文件本身不进入 Git。最新质量审计得到 103,197 三角面、24 骨骼、100,552 个有效蒙皮顶点、最大 4 影响、0 个零权重点、3 条 Root/Pelvis 位移轨道和 27 条需复核的循环曲线。`npm.cmd run verify` 会执行 check、23 项管线测试、9 项 Rust 测试和 production build；GUI 的布局与动画观感仍需人工确认。
+以上最新角色证据来自本机 `Testing_2` 运行；生成文件本身不进入 Git。最新质量审计得到 103,197 三角面、24 骨骼、100,552 个有效蒙皮顶点、最大 4 影响、0 个零权重点、3 条 Root/Pelvis 位移轨道和 27 条需复核的循环曲线。无 Blender 模式只提供兼容性，不替代这份审计。`npm.cmd run verify` 会执行客户端、管线、Rust 与 production build 检查；GUI 的布局与动画观感仍需人工确认。
 
 ## 后续计划与已知弱项
 
@@ -148,7 +150,7 @@ TACharacterStudio/
 - **7B 固化与泛化验证**：本机 production build 与手工验收；以第二个显著不同风格的角色跑同一节点图，证明流程没有写死。
 - **质量人工复核**：确认无变形组网格是否为附件，并检查 27 条循环曲线对应的脚底、Root/Pelvis 和首尾帧观感。
 - **泛化验证**：用第二个明显不同的角色复用同一节点图；除用户明确确认外不产生新的 API 消耗。
-- **最终打包与演示**：`npm.cmd run verify` 后生成 MSI/NSIS/SHA-256，并整理演示视频与 `Delivery/` 提交包。
+- **最终演示**：安装包、源码包与 SHA-256 由 `npm.cmd run delivery` 生成；仍需录制完整流程视频并完成人工视觉验收。
 
 已知弱项：自动动画仍可能有 Root/Pelvis 偏移、脚底接触、循环与局部穿插；肩、胯、膝、衣物未经标准与极限姿势测试；纹理的关键服装图案、材质分区、粗糙度层次和局部细节不足。分级处理原则：角色身份/比例/服装结构/关键纹样错误时回到参考图阶段；高面数、Transform、法线、Root/Pelvis、循环、脚底问题优先后期修正；贴图信息缺失可保留网格并重绘；严重权重或骨架错误进入 Blender 精修或重绑。
 
@@ -174,7 +176,7 @@ npm.cmd run tauri dev
 2. 首次验证建议在“技术信息”中启用“离线模拟”。
 3. 运行“生成三视图”，进入“切分视图”调整蓝色分隔线。
 4. 在“美术确认”中选择正面、侧面、背面；正面和背面为必需。
-5. 确认后运行 Generation，并按 Remesh、Rigging、Animation、Normalize、UE Import 继续；Normalize 会自动处理 Rigging 已产出的 Walk，不会再次请求 Meshy。
+5. 确认后运行 Generation，并按 Remesh、Rigging、Animation、Normalize、UE Import 继续；Normalize 会自动处理 Rigging 已产出的 Walk，不会再次请求 Meshy。测试机没有 Blender 时，在 Normalize 选择“无 Blender，跳过质检”后继续 UE Import。
 6. 在高级模式选择“角色动画”，可从产物下拉框切换预览 Idle、Walk、Run；UE Import 会自动导入 Idle 与 Walk。
 7. 已有工程可直接选择对应的 `manifest.json` 恢复。
 8. 换机时在“设置与服务”导入 `.tacs-project.zip`，运行“一键环境自检”；只复用参数时导入 `.tacs-profile.json`。
@@ -225,4 +227,5 @@ node pipeline/pipeline.mjs doctor --comfy-url http://127.0.0.1:8188 --tool-path 
 - Three.js 预览 GLB 和图片；FBX 仅支持导出、定位和 UE 导入。
 - Comfy 自定义节点源码位于 `integrations/comfy/`；安装或更新后必须完整重启 Comfy Desktop。
 - Blender、UE 和 Node 开发环境不随源码提供；安装包会内置 Node sidecar，但不内置 Blender/UE。
+- 无 Blender 兼容模式会保留角色、Idle、Walk 和 Preview Map，并按 Meshy 原始 FBX 的厘米单位使用 1.0 导入比例；它不执行法线、权重、身高、动画循环或 UE 骨骼命名检查，结果固定显示 WARNING。
 - 当前安装包未做商业代码签名，最终交付需说明 Windows SmartScreen 提示。

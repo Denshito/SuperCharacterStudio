@@ -31,6 +31,7 @@
 
 - [ ] 在未安装系统 Node.js 的 Windows x64 机器上安装并启动 MSI 或 NSIS。
 - [ ] 执行“一键环境自检”，缺少 Blender/UE/Comfy 时提示可操作。
+- [ ] 使用无效 Blender 路径时，可显式跳过 Normalize；Manifest 记录 SKIPPED/NOT_RUN，UE 报告为 WARNING。
 - [ ] 通过设置页安装 TA Comfy 节点，重启 ComfyUI 后检测为 PASS。
 - [ ] 重新计算并核对 `checksums.sha256`。
 - [ ] 录制参考图 → 三视图/切分 → Meshy → Normalize → UE Preview Map 的演示视频。

@@ -78,6 +78,12 @@ function fingerprint(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function characterPipelineStatus(stages) {
+  const statuses = CHARACTER_STAGES.map((name) => stages[name]?.status ?? "NOT_STARTED");
+  if (!statuses.every((status) => ["SUCCEEDED", "WARNING", "SKIPPED"].includes(status))) return "IN_PROGRESS";
+  return statuses.some((status) => status === "WARNING" || status === "SKIPPED") ? "WARNING" : "SUCCEEDED";
+}
+
 function relative(filePath, base = ROOT) {
   return path.relative(base, filePath).replaceAll("\\", "/");
 }
@@ -1020,25 +1026,26 @@ async function executeLocalStage(manifestPath, stageName, options) {
     expected = ["normalized-character.glb", "normalized-character.fbx", "validation.json"];
   } else {
     const script = path.join(ROOT, "tools", "ue_import.py");
-    const input = stageOutput(manifest.stages.normalize, "normalized-character.fbx", ".fbx");
-    if (!input) throw new Error("UE Import 需要 Normalize 阶段输出的 FBX。");
-    source = absolute(input.path, storageRoot);
-    const walkOutput = stageOutput(manifest.stages.normalize, "normalized-walk.fbx", ".fbx")
-      ?? stageOutput(manifest.stages.rigging, "result-basic-animations-walking-fbx.fbx", ".fbx");
-    const walkSource = walkOutput ? absolute(walkOutput.path, storageRoot) : "";
-    const hasWalk = walkSource && await fs.access(walkSource).then(() => true).catch(() => false);
+    const ueInputs = await resolveUeInputs(manifest, storageRoot);
+    source = ueInputs.source;
+    const walkSource = ueInputs.walkSource;
+    const hasWalk = Boolean(walkSource);
+    const importScale = ueInputs.sourceMode === "raw" ? 1 : (manifest.config.ue_import.import_uniform_scale ?? 100);
     executable = path.resolve(options.toolPath || "D:/UE/UE_5.4/Engine/Binaries/Win64/UnrealEditor-Cmd.exe");
     const project = path.resolve(options.ueProject || "E:/AIEval/Eval_Commiting/Eval_Commiting.uproject");
-    signature = { input: await sha256(source), walk: hasWalk ? await sha256(walkSource) : null, script: await sha256(script), project, config: manifest.config.ue_import };
+    signature = { input: await sha256(source), walk: hasWalk ? await sha256(walkSource) : null, sourceMode: ueInputs.sourceMode, importScale, script: await sha256(script), project, config: manifest.config.ue_import };
     const report = path.join(outputDir, "ue-import-report.json");
     args = [project, `-ExecutePythonScript=${script}`, "-unattended", "-nop4", "-nosplash", "-nullrhi"];
-    const textures = (manifest.stages.normalize.outputs || []).filter((item) => path.extname(item.path).toLowerCase() === ".png").map((item) => absolute(item.path, storageRoot));
     environment = {
-      TA_NORMALIZED_FBX: source,
+      TA_CHARACTER_FBX: source,
+      TA_SOURCE_MODE: ueInputs.sourceMode,
+      TA_VALIDATION_STATUS: ueInputs.validationStatus,
+      TA_WARNINGS: JSON.stringify(ueInputs.warnings),
+      TA_HAS_IDLE: ueInputs.hasIdle ? "1" : "0",
       TA_RUN_ID: manifest.runId,
       TA_UE_REPORT: report,
-      TA_TEXTURES: JSON.stringify(textures),
-      TA_UE_IMPORT_SCALE: String(manifest.config.ue_import.import_uniform_scale ?? 100),
+      TA_TEXTURES: JSON.stringify(ueInputs.textures),
+      TA_UE_IMPORT_SCALE: String(importScale),
       TA_UE_TWO_SIDED: manifest.config.ue_import.two_sided_material === false ? "0" : "1",
       TA_WALK_FBX: hasWalk ? walkSource : "",
     };
@@ -1054,6 +1061,11 @@ async function executeLocalStage(manifestPath, stageName, options) {
   }
   if (stage.inputHash && stage.inputHash !== inputHash) {
     stage.previousAttempts = [...(stage.previousAttempts || []), { status: stage.status, inputHash: stage.inputHash, outputs: stage.outputs, replacedAt: now() }];
+  }
+  if (stageName === "normalize") {
+    delete stage.reason;
+    delete stage.validationStatus;
+    if (manifest.stages["ue-import"]?.status !== "NOT_STARTED") manifest.stages["ue-import"].status = "STALE";
   }
   await Promise.all(expected.map((name) => fs.rm(path.join(outputDir, name), { force: true })));
   Object.assign(stage, { status: "RUNNING", progress: 0, startedAt: now(), inputHash, outputs: [], error: null });
@@ -1082,7 +1094,7 @@ async function executeLocalStage(manifestPath, stageName, options) {
     const files = stageName === "normalize" ? [...report.outputs, ...(normalizedWalk ? [normalizedWalk] : []), reportPath] : [reportPath];
     stage.outputs = await Promise.all(files.map((file) => outputRecord(path.resolve(file), storageRoot)));
     Object.assign(stage, { status: report.status === "WARNING" ? "WARNING" : "SUCCEEDED", progress: 100, finishedAt: now(), report });
-    manifest.status = stageName === "ue-import" && stage.status === "SUCCEEDED" ? "SUCCEEDED" : "IN_PROGRESS";
+    manifest.status = characterPipelineStatus(manifest.stages);
     delete manifest.lastError;
     await saveManifest(resolvedManifest, manifest);
     emit({ type: "complete", stage: stageName, status: stage.status, progress: 100 });
@@ -1094,6 +1106,96 @@ async function executeLocalStage(manifestPath, stageName, options) {
     await saveManifest(resolvedManifest, manifest);
     throw error;
   }
+}
+
+async function existingOutput(stage, fileName, storageRoot) {
+  const output = stageOutput(stage, fileName, path.extname(fileName));
+  if (!output) return "";
+  const file = absolute(output.path, storageRoot);
+  return await fs.stat(file).then((item) => item.isFile() ? file : "").catch(() => "");
+}
+
+export async function resolveUeInputs(manifest, storageRoot) {
+  const normalized = ["SUCCEEDED", "WARNING"].includes(manifest.stages.normalize?.status)
+    ? await existingOutput(manifest.stages.normalize, "normalized-character.fbx", storageRoot)
+    : "";
+  if (normalized) {
+    const walkSource = await existingOutput(manifest.stages.normalize, "normalized-walk.fbx", storageRoot)
+      || await existingOutput(manifest.stages.rigging, "result-basic-animations-walking-fbx.fbx", storageRoot);
+    const textures = (manifest.stages.normalize.outputs || [])
+      .filter((item) => path.extname(item.path).toLowerCase() === ".png")
+      .map((item) => absolute(item.path, storageRoot));
+    return {
+      sourceMode: "normalized",
+      validationStatus: manifest.stages.normalize.status,
+      source: normalized,
+      walkSource,
+      textures,
+      hasIdle: manifest.stages.animation?.status === "SUCCEEDED",
+      warnings: [],
+    };
+  }
+  if (manifest.stages.normalize?.status !== "SKIPPED") {
+    throw new Error("UE Import 需要先完成 Normalize，或明确选择“无 Blender，跳过质检”。");
+  }
+  const animation = await existingOutput(manifest.stages.animation, "result-animation-fbx.fbx", storageRoot);
+  const rigged = await existingOutput(manifest.stages.rigging, "result-rigged-character-fbx.fbx", storageRoot);
+  const source = animation || rigged;
+  if (!source) throw new Error("无 Blender 兼容模式需要 Animation 或 Rigging 阶段的原始 FBX。");
+  const walkSource = await existingOutput(manifest.stages.rigging, "result-basic-animations-walking-fbx.fbx", storageRoot);
+  const warnings = [
+    "未运行 Blender Normalize：法线、权重、骨骼命名、身高与动画循环未经本地质检。",
+    "Meshy 原始 FBX 使用原生厘米比例导入；Normalize 路线的 100 倍补偿不适用于此模式。",
+  ];
+  if (!animation) warnings.push("未找到 Idle Animation FBX；Preview Map 将优先播放 Walk。");
+  if (!walkSource) warnings.push("未找到 Walking FBX；UE 中不会创建 Walk 动画。");
+  return {
+    sourceMode: "raw",
+    validationStatus: "NOT_RUN",
+    source,
+    walkSource,
+    textures: [],
+    hasIdle: Boolean(animation),
+    warnings,
+  };
+}
+
+export async function skipNormalize(manifestPath) {
+  const resolved = path.resolve(manifestPath);
+  const manifest = JSON.parse(await fs.readFile(resolved, "utf8"));
+  const currentConfig = JSON.parse(await fs.readFile(path.join(ROOT, "config.json"), "utf8"));
+  upgradeManifest(manifest, currentConfig);
+  const storageRoot = rootForManifest(resolved);
+  const rawSource = await existingOutput(manifest.stages.animation, "result-animation-fbx.fbx", storageRoot)
+    || await existingOutput(manifest.stages.rigging, "result-rigged-character-fbx.fbx", storageRoot);
+  if (!rawSource) throw new Error("跳过 Normalize 前必须已有 Animation 或 Rigging 阶段的原始 FBX。");
+  const stage = manifest.stages.normalize;
+  if (!["NOT_STARTED", "SKIPPED"].includes(stage.status)) {
+    stage.previousAttempts = [...(stage.previousAttempts || []), {
+      status: stage.status,
+      inputHash: stage.inputHash ?? null,
+      outputs: stage.outputs ?? [],
+      replacedAt: now(),
+    }];
+  }
+  delete stage.inputHash;
+  delete stage.startedAt;
+  delete stage.report;
+  Object.assign(stage, {
+    status: "SKIPPED",
+    progress: 100,
+    outputs: [],
+    error: null,
+    reason: "Blender unavailable; local validation was not run",
+    validationStatus: "NOT_RUN",
+    finishedAt: now(),
+  });
+  if (manifest.stages["ue-import"]?.status !== "NOT_STARTED") manifest.stages["ue-import"].status = "STALE";
+  manifest.status = characterPipelineStatus(manifest.stages);
+  delete manifest.lastError;
+  await saveManifest(resolved, manifest);
+  emit({ type: "complete", stage: "normalize", status: "SKIPPED", progress: 100, validationStatus: "NOT_RUN" });
+  return manifest;
 }
 
 export async function executeStage(manifestPath, stageName, { allowSpend = false, resumeOnly = false, inputArtifact, toolPath, ueProject, remesh, normalize, imageTurnaround, comfyUrl, comfyPreset, comfyPrompt } = {}) {
@@ -1169,7 +1271,7 @@ export async function executeStage(manifestPath, stageName, { allowSpend = false
       if (stages.rigging?.status !== "SUCCEEDED" || !stages.rigging.taskId) throw new Error("rigging 尚未成功，不能创建 Animation。");
       task = await ensureStage({ stage: stages.animation, createBody: { rig_task_id: stages.rigging.taskId, action_id: config.animation.action_id }, inputSignature: { upstream: stages.rigging.taskId, config: config.animation }, manifest, manifestPath: resolvedManifest, runDir, storageRoot, config, allowSpend, resumeOnly });
     }
-    manifest.status = CHARACTER_STAGES.every((name) => ["SUCCEEDED", "SKIPPED"].includes(stages[name]?.status)) ? "SUCCEEDED" : "IN_PROGRESS";
+    manifest.status = characterPipelineStatus(stages);
     delete manifest.lastError;
     await saveManifest(resolvedManifest, manifest);
     emit({ type: "stage-finished", stage: stageName, status: stages[stageName].status, manifest: resolvedManifest });
@@ -1260,6 +1362,7 @@ function usage() {
   node pipeline.mjs execute comfy-prep --manifest <manifest.json> [--comfy-url <url>] [--comfy-preset <preset>] [--comfy-prompt <extra>] --json
   node pipeline.mjs execute normalize --manifest <manifest.json> [--tool-path <blender.exe>] [--height 1.6] --json
   node pipeline.mjs execute ue-import --manifest <manifest.json> --ue-project <project.uproject> [--tool-path <UnrealEditor-Cmd.exe>] --json
+  node pipeline.mjs skip normalize --manifest <manifest.json> --json
   node pipeline.mjs resume <stage> --manifest <manifest.json> --json
   node pipeline.mjs inspect --manifest <manifest.json> --json
   node pipeline.mjs approve-references --manifest <manifest.json> --front <artifact> [--side <artifact>] --back <artifact> --json
@@ -1312,6 +1415,7 @@ async function main() {
   }
   if (command === "inspect" && manifestPath) return inspectManifest(manifestPath);
   if (command === "approve-references" && manifestPath) return approveReferences(manifestPath, { front, side, back });
+  if (command === "skip" && values[0] === "normalize" && manifestPath) return skipNormalize(manifestPath);
   if (command === "execute" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, inputArtifact, toolPath, ueProject, remesh: targetPolycount === undefined ? undefined : { target_polycount: Number(targetPolycount) }, normalize: { ...(height ? { height_meters: Number(height) } : {}), ...(rootCorrection ? { root_correction_degrees: rootCorrection } : {}), ...(pelvisCorrection ? { pelvis_correction_degrees: pelvisCorrection } : {}) }, imageTurnaround: { ...(imagePreset ? { preset: imagePreset } : {}), ...(imageQuality ? { quality: imageQuality } : {}), ...(imageBackground ? { background: imageBackground } : {}), ...(imagePrompt !== undefined ? { prompt_extra: imagePrompt } : {}) }, comfyUrl, comfyPreset, comfyPrompt });
   if (command === "resume" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, resumeOnly: true, inputArtifact });
   if (command === "run" && values.length >= 2) {

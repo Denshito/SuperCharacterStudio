@@ -43,7 +43,7 @@ const states: NodeRunState[] = ["NOT_STARTED", "RUNNING", "SUCCEEDED", "WARNING"
 export function toRunState(value?: string): NodeRunState {
   const normalized = value?.toUpperCase() as NodeRunState;
   if (["SUBMITTED", "PENDING", "IN_PROGRESS"].includes(normalized)) return "RUNNING";
-  if (normalized === "SKIPPED") return "SUCCEEDED";
+  if (normalized === "SKIPPED") return "WARNING";
   if (normalized === "CANCELED") return "WARNING";
   return states.includes(normalized) ? normalized : "NOT_STARTED";
 }

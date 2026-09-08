@@ -4,8 +4,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$msi = Join-Path $repo 'src-tauri\target\release\bundle\msi\TA Character Studio_0.1.0_x64_en-US.msi'
-$nsis = Join-Path $repo 'src-tauri\target\release\bundle\nsis\TA Character Studio_0.1.0_x64-setup.exe'
+$msi = Join-Path $repo 'src-tauri\target\release\bundle\msi\TA Character Studio_1.0.0_x64_en-US.msi'
+$nsis = Join-Path $repo 'src-tauri\target\release\bundle\nsis\TA Character Studio_1.0.0_x64-setup.exe'
 if (-not (Test-Path -LiteralPath $msi -PathType Leaf) -or -not (Test-Path -LiteralPath $nsis -PathType Leaf)) { throw 'Build MSI and NSIS with npm.cmd run bundle first.' }
 
 $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -14,7 +14,7 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 try {
   $sourceStage = Join-Path $staging 'TACharacterStudio'
   New-Item -ItemType Directory -Path $sourceStage | Out-Null
-  $files = & git -C $repo ls-files --cached --others --exclude-standard
+  $files = & git -C $repo ls-files --cached
   foreach ($relative in $files) {
     $source = Join-Path $repo $relative
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }

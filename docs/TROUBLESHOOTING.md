@@ -10,6 +10,7 @@
 | 产物显示缺失 | 文件被移动/删除；恢复到 Manifest 记录的位置，或从合法中间产物重新连接 |
 | Normalize 报无变形组网格 | 先确认是否为眼睛/附件；需要随骨骼变形时在 Blender 权重绑定 |
 | Normalize 报循环曲线不一致 | 在预览中检查首尾帧、Root/Pelvis 与脚底；必要时在 Blender 清理曲线 |
+| 测试机没有 Blender | 在 Normalize 节点选择“无 Blender，跳过质检”；UE 可继续导入，但结果固定为 WARNING |
 | UE 出现重复资产 | 必须使用稳定的 `/Game/Generated/<runId>/` 路径，不要手动改名后重复导入 |
 | Windows SmartScreen 提示 | 当前测试交付未做商业代码签名；核对 `checksums.sha256` 后选择继续 |
 

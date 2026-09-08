@@ -2,8 +2,8 @@
 
 更新时间：2026-09-08
 仓库：`Denshito/TACharacterStudio`（Private）
-分支：`Meshy/GPTImage`
-已提交基线：`fbc37c4 feat: integrate Meshy and GPT Image workflow`
+分支：`main`
+发布版本：`1.0.0`
 
 > 本文记录当前状态和后续路线。它区分已实际验证、自动测试通过、Mock 验证、计划中四种状态；不记录 API Key、测试角色图片、生成模型或 UE 资产。
 
@@ -36,7 +36,7 @@ Tauri + React + TypeScript + XYFlow + Three.js
 → Remesh
 → Rigging
 → Animation
-→ Blender Normalize / Validation
+→ Blender Normalize / Validation（可显式跳过并记录 WARNING）
 → Unreal Engine Import / Preview Map
 ```
 
@@ -59,6 +59,7 @@ Tauri + React + TypeScript + XYFlow + Three.js
 | Remesh | 实际验证 | 高面数资产经 `/openapi/v1/remesh` 可继续绑定 |
 | Rigging / Animation | 实际验证 | 24 骨骼与动画资产；动作观感和蒙皮仍待美术修复 |
 | Blender Normalize / 质量审计 | 实际验证 | 1.6 m、103,086 三角面、24 骨骼；权重、循环曲线、Root Motion 与贴图报告 |
+| 无 Blender 兼容模式 | 实际验证 | 显式跳过质检；原始 FBX 以 1.0 比例导入，160.00 cm、Idle/Walk、材质纹理与 Preview Map 均成功；状态固定为 WARNING |
 | UE Import | 实际验证 | 稳定资产路径、Preview Map、可重复导入流程 |
 | GPT Image 2 | Mock 通过 | 三视图、切分、门禁、付费阻断、路径安全；待一次 Low 质量真实调用 |
 | Comfy Bridge（7D） | 实际验证 | Studio 上传/下载/切分真实往返；一次 Low 请求成功，费用 `$0.0099` |

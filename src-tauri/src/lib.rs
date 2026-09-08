@@ -1281,7 +1281,14 @@ fn start_pipeline(
     }
     if !matches!(
         operation.as_str(),
-        "init" | "execute" | "resume" | "check" | "check-comfy" | "doctor" | "approve-references"
+        "init"
+            | "execute"
+            | "resume"
+            | "skip"
+            | "check"
+            | "check-comfy"
+            | "doctor"
+            | "approve-references"
     ) {
         return Err("不支持的管线操作".into());
     }
@@ -1303,6 +1310,9 @@ fn start_pipeline(
         )
     ) {
         return Err("请选择可执行的管线阶段".into());
+    }
+    if operation == "skip" && stage.as_deref() != Some("normalize") {
+        return Err("当前只允许显式跳过 Normalize".into());
     }
 
     let script = pipeline_script(&app)?;
@@ -1454,7 +1464,7 @@ fn start_pipeline(
                 args.extend(["--target-polycount".into(), value.to_string()]);
             }
         }
-        if stage_name == "normalize" {
+        if stage_name == "normalize" && operation != "skip" {
             let blender = validated_file(blender_path, "D:/Blender/blender.exe", "blender.exe")?;
             let height = target_height.unwrap_or(1.6);
             if !(0.5..=3.0).contains(&height) {

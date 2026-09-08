@@ -33,7 +33,13 @@ def import_task(filename, destination, options):
 
 
 def main():
-    source = os.environ["TA_NORMALIZED_FBX"]
+    source = os.environ["TA_CHARACTER_FBX"]
+    source_mode = os.environ.get("TA_SOURCE_MODE", "normalized")
+    if source_mode not in ("normalized", "raw"):
+        raise RuntimeError(f"unsupported source mode: {source_mode}")
+    validation_status = os.environ.get("TA_VALIDATION_STATUS", "SUCCEEDED")
+    warnings = json.loads(os.environ.get("TA_WARNINGS", "[]"))
+    has_idle = os.environ.get("TA_HAS_IDLE", "1") == "1"
     run_id = os.environ["TA_RUN_ID"]
     report_path = os.environ["TA_UE_REPORT"]
     texture_files = json.loads(os.environ.get("TA_TEXTURES", "[]"))
@@ -51,8 +57,8 @@ def main():
     mesh_options.import_mesh = True
     mesh_options.import_as_skeletal = True
     mesh_options.import_animations = False
-    mesh_options.import_materials = False
-    mesh_options.import_textures = False
+    mesh_options.import_materials = source_mode == "raw"
+    mesh_options.import_textures = source_mode == "raw"
     mesh_options.automated_import_should_detect_type = False
     mesh_options.mesh_type_to_import = unreal.FBXImportType.FBXIT_SKELETAL_MESH
     mesh_options.skeletal_mesh_import_data.import_uniform_scale = import_scale
@@ -89,6 +95,14 @@ def main():
             slots[0].material_interface = material
             skeletal_mesh.set_editor_property("materials", slots)
         unreal.EditorAssetLibrary.save_loaded_asset(skeletal_mesh)
+    elif source_mode == "raw":
+        slots = list(skeletal_mesh.get_editor_property("materials"))
+        material = slots[0].material_interface if slots else None
+        if isinstance(material, unreal.Material):
+            material.set_editor_property("two_sided", two_sided)
+            material.set_editor_property("used_with_skeletal_mesh", True)
+            unreal.MaterialEditingLibrary.recompile_material(material)
+            unreal.EditorAssetLibrary.save_loaded_asset(material)
 
     # Idle 和 Walk 必须都指向刚创建的 Skeleton，UE 才不会生成重复骨架。
     animation_options = unreal.FbxImportUI()
@@ -104,16 +118,18 @@ def main():
     # Meshy 动画可能以 0.8 等子帧开始；吸附到帧边界可避免 UE 5.4 拒绝导入。
     animation_options.anim_sequence_import_data.set_editor_property("snap_to_closest_frame_boundary", True)
     unreal.EditorAssetLibrary.delete_directory(f"{destination}/Animation")
-    animation_paths = import_task(source, f"{destination}/Animation", animation_options)
-    animation = next((unreal.EditorAssetLibrary.load_asset(path) for path in animation_paths if isinstance(unreal.EditorAssetLibrary.load_asset(path), unreal.AnimSequence)), None)
-    if not animation:
-        raise RuntimeError("UE 未生成 Animation Sequence")
-    idle_path = f"{destination}/Animation/Idle"
-    if unreal.EditorAssetLibrary.does_asset_exist(idle_path):
-        unreal.EditorAssetLibrary.delete_asset(idle_path)
-    if not unreal.EditorAssetLibrary.rename_asset(animation.get_path_name().split(".")[0], idle_path):
-        raise RuntimeError("无法将默认动画命名为 Idle")
-    animation = unreal.EditorAssetLibrary.load_asset(idle_path)
+    animation = None
+    if has_idle:
+        animation_paths = import_task(source, f"{destination}/Animation", animation_options)
+        animation = next((unreal.EditorAssetLibrary.load_asset(path) for path in animation_paths if isinstance(unreal.EditorAssetLibrary.load_asset(path), unreal.AnimSequence)), None)
+        if not animation:
+            raise RuntimeError("UE 未生成 Animation Sequence")
+        idle_path = f"{destination}/Animation/Idle"
+        if unreal.EditorAssetLibrary.does_asset_exist(idle_path):
+            unreal.EditorAssetLibrary.delete_asset(idle_path)
+        if not unreal.EditorAssetLibrary.rename_asset(animation.get_path_name().split(".")[0], idle_path):
+            raise RuntimeError("无法将默认动画命名为 Idle")
+        animation = unreal.EditorAssetLibrary.load_asset(idle_path)
 
     walk_animation = None
     if walk_source and os.path.isfile(walk_source):
@@ -141,9 +157,10 @@ def main():
         raise RuntimeError("无法在 Preview Map 中放置角色")
     actor.set_actor_label(f"TA_{run_id}")
     component = actor.get_component_by_class(unreal.SkeletalMeshComponent)
-    if animation and component:
+    preview_animation = animation or walk_animation
+    if preview_animation and component:
         component.set_animation_mode(unreal.AnimationMode.ANIMATION_SINGLE_NODE)
-        component.set_animation(animation)
+        component.set_animation(preview_animation)
         component.play(True)
     actor_subsystem.spawn_actor_from_class(unreal.DirectionalLight, unreal.Vector(200, -200, 300), unreal.Rotator(-35, -45, 0))
     actor_subsystem.spawn_actor_from_class(unreal.SkyLight, unreal.Vector(0, 0, 200))
@@ -156,11 +173,16 @@ def main():
     unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)
 
     assets = sorted(unreal.EditorAssetLibrary.list_assets(destination, recursive=True, include_folder=False))
+    if source_mode == "raw":
+        texture_assets = [asset for asset in assets if isinstance(unreal.EditorAssetLibrary.load_asset(asset), unreal.Texture)]
     mesh_bounds = skeletal_mesh.get_bounds()
     report = {
         "version": 1,
-        "status": "PASS",
+        "status": "WARNING" if source_mode == "raw" else "PASS",
         "runId": run_id,
+        "sourceMode": source_mode,
+        "validationStatus": validation_status,
+        "warnings": warnings,
         "destination": destination,
         "skeletalMesh": skeletal_mesh.get_path_name(),
         "skeleton": skeleton.get_path_name(),
@@ -171,7 +193,7 @@ def main():
         },
         "previewMap": map_path,
         "previewActor": actor.get_path_name(),
-        "animationPlaying": bool(animation and component),
+        "animationPlaying": bool(preview_animation and component),
         "importUniformScale": import_scale,
         "twoSidedMaterial": two_sided,
         "boundsCentimeters": {
@@ -186,7 +208,7 @@ def main():
     with open(report_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
     emit("artifact", stage="ue-import", path=report_path)
-    emit("complete", stage="ue-import", status="PASS", progress=100)
+    emit("complete", stage="ue-import", status=report["status"], progress=100)
 
 
 try:

@@ -34,6 +34,7 @@ const legacyExecutableStages = ["generation", "remesh", "rigging", "animation", 
 const creditEstimate: Record<string, number> = { generation: 30, remesh: 5, rigging: 5, animation: 3 };
 const stageLabels: Record<string, string> = { "image-turnaround": "生成三视图", "comfy-prep": "Comfy 参考图", "view-split": "切分视图", "reference-approval": "美术确认", generation: "生成模型", remesh: "减面优化", rigging: "骨骼绑定", animation: "角色动画", normalize: "规格统一", "ue-import": "导入 UE" };
 const statusLabels: Record<string, string> = { NOT_STARTED: "未开始", RUNNING: "进行中", SUCCEEDED: "已完成", WARNING: "需检查", FAILED: "失败", STALE: "需更新", SKIPPED: "已跳过" };
+const completedStageStatuses = ["SUCCEEDED", "WARNING", "SKIPPED"];
 interface ProcessLine { stream: string; line: string; }
 interface ComfyStatus { running: boolean; ready: boolean; version?: string | null; missingNodes?: string[]; }
 interface EnvironmentCheck { id: string; label: string; status: "PASS" | "WARNING" | "FAIL"; message: string; }
@@ -212,7 +213,7 @@ function App() {
               ...current,
               stages: { ...current.stages, [event.stage]: { ...current.stages[event.stage], status: event.status ?? current.stages[event.stage]?.status ?? "RUNNING", progress: event.progress ?? current.stages[event.stage]?.progress } },
             } : current);
-            if (event.status === "SUCCEEDED") setStaleNodeIds((current) => {
+            if (event.status && completedStageStatuses.includes(event.status)) setStaleNodeIds((current) => {
               const next = current.filter((id) => id !== event.stage);
               persistGraph(customEdges, next);
               return next;
@@ -425,7 +426,7 @@ function App() {
     } catch (reason) { setMessage(`无法确认参考图：${String(reason)}`); }
   };
 
-  const runPipeline = async (operation: "execute" | "resume" | "check", stage?: string) => {
+  const runPipeline = async (operation: "execute" | "resume" | "skip" | "check", stage?: string) => {
     // 确认只对本次 IPC 调用有效；Key 由 Rust 放入 sidecar 环境变量，不进入命令行或 Manifest。
     if (runningStage) return;
     if (stage === "reference-approval") { await approveReferenceSelection(); return; }
@@ -476,7 +477,7 @@ function App() {
         comfyPrompt,
       });
       setRunningStage(stage ?? "check");
-      setMessage(operation === "check" ? "正在执行只读权限检查…" : `${stageLabels[stage ?? ""]} 已启动；task ID 会立即写入 Manifest。`);
+      setMessage(operation === "check" ? "正在执行只读权限检查…" : operation === "skip" ? "正在记录跳过 Blender 质检…" : `${stageLabels[stage ?? ""]} 已启动；task ID 会立即写入 Manifest。`);
     } catch (reason) {
       runQueue.current = [];
       setLogExpanded(true);
@@ -484,6 +485,15 @@ function App() {
     }
   };
   launchStage.current = (stage) => { void runPipeline("execute", stage); };
+
+  const skipNormalize = async () => {
+    if (runningStage) return;
+    const accepted = await confirmDialog("将跳过 Blender Normalize，并直接使用 Meshy 原始 FBX 进入 UE。法线、权重、骨骼命名、身高和动画循环不会被本地质检，最终状态将标记为 WARNING。", {
+      title: "无 Blender 兼容模式",
+      kind: "warning",
+    });
+    if (accepted) await runPipeline("skip", "normalize");
+  };
 
   const checkComfy = async () => {
     if (runningStage) return;
@@ -509,7 +519,7 @@ function App() {
     const linear = base.filter((id) => id !== "comfy-prep");
     const workflow = actionStage === "comfy-prep" ? ["comfy-prep", ...linear.slice(linear.indexOf("view-split"))] : linear;
     const start = workflow.indexOf(actionStage);
-    let pending = workflow.slice(start).filter((id, index) => index === 0 || staleNodeIds.includes(id) || !["SUCCEEDED", "SKIPPED"].includes(manifest?.stages[id]?.status ?? ""));
+    let pending = workflow.slice(start).filter((id, index) => index === 0 || staleNodeIds.includes(id) || !completedStageStatuses.includes(manifest?.stages[id]?.status ?? ""));
     const review = pending.indexOf("reference-approval");
     if (review > 0) pending = pending.slice(0, review);
     const [first, ...rest] = pending;
@@ -557,10 +567,10 @@ function App() {
   const qualityReport = currentStage?.report as { status?: string; metrics?: Record<string, number>; warnings?: string[] } | undefined;
   const workflowStages = manifest?.stages["reference-source"] ? executableStages : legacyExecutableStages;
   const selectedExecutable = stageIds.filter((id) => workflowStages.includes(id) && Boolean(manifest?.stages[id]));
-  const actionStage = selectedExecutable.find((id) => !["SUCCEEDED", "SKIPPED"].includes(manifest?.stages[id]?.status ?? "")) ?? selectedExecutable.at(-1);
+  const actionStage = selectedExecutable.find((id) => !completedStageStatuses.includes(manifest?.stages[id]?.status ?? "")) ?? selectedExecutable.at(-1);
   const actionManifestStage = actionStage ? manifest?.stages[actionStage] : undefined;
-  const actionFinished = ["SUCCEEDED", "SKIPPED"].includes(actionManifestStage?.status ?? "") && !staleNodeIds.includes(actionStage ?? "");
-  const actionLabel = actionStage === "image-turnaround" ? "生成三视图" : actionStage === "comfy-prep" ? "在 Comfy 准备参考图" : actionStage === "view-split" ? "保存切分结果" : actionStage === "reference-approval" ? "确认采用视图" : actionFinished ? "检查并复用" : "运行当前节点";
+  const actionFinished = completedStageStatuses.includes(actionManifestStage?.status ?? "") && !staleNodeIds.includes(actionStage ?? "");
+  const actionLabel = actionStage === "image-turnaround" ? "生成三视图" : actionStage === "comfy-prep" ? "在 Comfy 准备参考图" : actionStage === "view-split" ? "保存切分结果" : actionStage === "reference-approval" ? "确认采用视图" : actionStage === "normalize" && actionManifestStage?.status === "SKIPPED" ? "运行 Blender 完整质检" : actionFinished ? "检查并复用" : "运行当前节点";
 
   return (
     <main className="app-shell">
@@ -692,6 +702,9 @@ function App() {
             <label className="field-label">目标身高（米）</label><input className="key-input" type="number" min="0.5" max="3" step="0.01" value={targetHeight} onChange={(event) => setTargetHeight(Number(event.target.value))} />
             <label className="field-label">Root 旋转 X,Y,Z</label><input className="key-input" value={rootCorrection} onChange={(event) => setRootCorrection(event.target.value)} />
             <label className="field-label">Pelvis 旋转 X,Y,Z</label><input className="key-input" value={pelvisCorrection} onChange={(event) => setPelvisCorrection(event.target.value)} />
+            {actionManifestStage?.status === "SKIPPED"
+              ? <small>兼容模式：Blender 质检未运行，UE 将使用 Meshy 原始 FBX，最终结果只能标记为需检查。</small>
+              : <button className="wide" onClick={skipNormalize} disabled={!manifest || Boolean(runningStage)}>无 Blender，跳过质检</button>}
           </section>}
 
           <section className="primary-task">

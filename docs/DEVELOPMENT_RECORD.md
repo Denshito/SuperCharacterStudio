@@ -199,7 +199,7 @@ DeepSeek V4 曾作为可用的文本模型方案进行评估，但当前闭环�
 |---|---|
 | TypeScript + Cargo check | PASS |
 | 管线 Mock 测试 | 23/23 PASS |
-| Rust 后端测试 | 9/9 PASS（最近完整回归） |
+| Rust 后端测试 | 10/10 PASS（最近完整回归） |
 | Vite 生产构建 | PASS |
 | Meshy Generation / Remesh / Rigging / Animation | 真实任务 PASS |
 | Comfy 上传、回传和切分 | PASS |
@@ -218,7 +218,7 @@ DeepSeek V4 曾作为可用的文本模型方案进行评估，但当前闭环�
 - 纹理需要人工检查关键服装图案、材质分区、粗糙度和局部清晰度。
 - UE IK Rig、IK Retargeter 和 Retarget Pose 当前留给用户手工建立。
 - OpenAI 直连 GPT Image 2 仍只有 Mock 证据；已验证闭环使用 ComfyUI + OpenRouter。
-- 最新源码改动后尚未重新生成最终 MSI/NSIS，也尚未做商业代码签名。
+- 1.0.0 源码已完成完整自动回归；最终 MSI/NSIS 由 `npm.cmd run bundle` 重建，暂未做商业代码签名。
 
 ## 9. 构建与测试命令
 
@@ -292,3 +292,9 @@ API Key
 ```
 
 生成模型、贴图和 `.uasset` 是否提交取决于它们是否是评审必需的最终结果。只保留能够证明最终角色和 UE Preview Map 的精简资产，不提交重复缓存或所有历史运行。
+
+## 12. 1.0 无 Blender 兼容模式
+
+最终候选版增加显式跳过 Normalize 的降级路线。只有用户确认“无 Blender，跳过质检”后，UE Import 才会改读 Meshy 的原始 Animation/Rigging FBX；Idle 优先来自 Animation，Walk 来自 Rigging。该路线保留自动导入和 Preview Map，但 Manifest 与 UE 报告固定记录 `SKIPPED/NOT_RUN/WARNING`，避免把未执行的法线、权重、骨骼命名、身高和循环检查误报为通过。正常 Blender 路线及既有验证证据保持不变。
+
+实际隔离验证使用 `Testing_2_NoBlender`：未启动 Blender，UE 5.4 导入角色、Idle、Walk、材质和 2 张纹理共 9 个稳定资产，Preview Map 创建成功，角色高度 160.00 cm。Meshy 原始 FBX 已采用厘米单位，因此 raw 模式导入比例为 1.0；规范化 FBX 仍使用 100 倍补偿。验证副本不进入 Git 或最终 UE 工程包。

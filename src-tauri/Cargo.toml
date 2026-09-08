@@ -1,6 +1,6 @@
 [package]
 name = "ta-character-studio"
-version = "0.1.0"
+version = "1.0.0"
 description = "Node-based AI character asset pipeline client"
 authors = ["Zst"]
 edition = "2021"

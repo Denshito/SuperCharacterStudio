@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { approveReferences, buildComfyWorkflow, collectAssetUrls, createRun, createRunFromReferences, encodePng, executeStage, mimeFor, splitPng, taskSnapshot, upgradeManifest } from "./pipeline.mjs";
+import { approveReferences, buildComfyWorkflow, collectAssetUrls, createRun, createRunFromReferences, encodePng, executeStage, mimeFor, resolveUeInputs, skipNormalize, splitPng, taskSnapshot, upgradeManifest } from "./pipeline.mjs";
 
 // 极简 ComfyUI HTTP 服务模拟：覆盖检测、上传、提交、历史和下载，
 // 用于在无真实 ComfyUI 的情况下验证桥接的真实 HTTP 代码路径。
@@ -332,6 +332,50 @@ test("runs remesh from an approved local GLB without a generation output", async
     assert.equal(replaced.stages.remesh.previousAttempts.length, 1);
   } finally {
     delete process.env.TA_PIPELINE_MOCK;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("skips Blender explicitly and resolves raw UE inputs without launching a tool", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ta-pipeline-no-blender-"));
+  const runDir = path.join(directory, "output", "raw-run");
+  const manifestPath = path.join(runDir, "manifest.json");
+  const animationFbx = path.join(runDir, "animation", "result-animation-fbx.fbx");
+  const riggedFbx = path.join(runDir, "rigging", "result-rigged-character-fbx.fbx");
+  const walkFbx = path.join(runDir, "rigging", "result-basic-animations-walking-fbx.fbx");
+  await mkdir(path.dirname(animationFbx), { recursive: true });
+  await mkdir(path.dirname(riggedFbx), { recursive: true });
+  await writeFile(animationFbx, "idle");
+  await writeFile(riggedFbx, "rigged");
+  await writeFile(walkFbx, "walk");
+  const output = (file) => ({ path: path.relative(directory, file).replaceAll("\\", "/") });
+  const manifest = stageManifest();
+  manifest.runId = "raw-run";
+  manifest.stages.animation = { name: "animation", status: "SUCCEEDED", outputs: [output(animationFbx)] };
+  manifest.stages.rigging.outputs = [output(riggedFbx), output(walkFbx)];
+  manifest.stages.normalize = { name: "normalize", status: "NOT_STARTED", outputs: [] };
+  manifest.stages["ue-import"] = { name: "ue-import", status: "SUCCEEDED", outputs: [] };
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  try {
+    await skipNormalize(manifestPath);
+    let saved = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.equal(saved.stages.normalize.status, "SKIPPED");
+    assert.equal(saved.stages.normalize.validationStatus, "NOT_RUN");
+    assert.equal(saved.stages.normalize.report, undefined);
+    assert.equal(saved.stages["ue-import"].status, "STALE");
+    let inputs = await resolveUeInputs(saved, directory);
+    assert.equal(inputs.sourceMode, "raw");
+    assert.equal(inputs.source, animationFbx);
+    assert.equal(inputs.walkSource, walkFbx);
+    assert.equal(inputs.hasIdle, true);
+
+    await rm(animationFbx);
+    saved = JSON.parse(await readFile(manifestPath, "utf8"));
+    inputs = await resolveUeInputs(saved, directory);
+    assert.equal(inputs.source, riggedFbx);
+    assert.equal(inputs.hasIdle, false);
+    assert.match(inputs.warnings.join(" "), /Idle/);
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

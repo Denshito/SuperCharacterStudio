@@ -44,7 +44,7 @@ TA Character Studio 把一张或多张角色参考图组织为可在 Unreal Engi
 4. 确认内置 Node 和管线为 `PASS`。
 5. 需要哪个外部阶段，就确认对应的 ComfyUI、Blender 或 UE 为 `PASS`。
 
-缺少 Blender/UE 不影响前面的参考图、建模和 3D 预览，但对应本地阶段不能运行。
+缺少 Blender/UE 不影响前面的参考图、建模和 3D 预览。缺少 Blender 时可显式跳过质检并继续 UE；缺少 UE 时只能导出产物，不能自动导入。
 
 ## 3. ComfyUI 的准备方式
 
@@ -205,11 +205,15 @@ LeftForeArm → lowerarm_l
 
 `WARNING` 不等于失败。循环曲线警告需要在预览中重点检查脚底、身体倾斜和首尾跳变。
 
+### 测试机没有 Blender
+
+在 Normalize 节点选择“无 Blender，跳过质检”，确认提示后即可继续 UE Import。此模式直接使用 Meshy 的 Animation/Rigging FBX，保留 Idle 和 Walk，并按原始 FBX 的厘米单位使用 1.0 导入比例；Blender 规范化 FBX 才使用 100 倍补偿。该模式不会执行法线、权重、骨骼命名、身高与循环检查。Normalize 显示“已跳过”，UE Import 和项目显示“需检查”，不能作为质量审计 PASS 证据。
+
 ## 8. 自动导入 Unreal Engine
 
 1. 在设置中选择 `UnrealEditor-Cmd.exe`。
 2. 选择目标 `.uproject`。
-3. 确认 Normalize 已产生 `normalized-character.fbx`。
+3. 确认 Normalize 已产生 `normalized-character.fbx`；或已经显式选择“无 Blender，跳过质检”。
 4. 运行“UE Import”。
 5. 等待命令行 UE 退出并查看 `ue-import-report.json`。
 6. 用普通 Unreal Editor 打开项目进行人工检查。
