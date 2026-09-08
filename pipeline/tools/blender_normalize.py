@@ -17,6 +17,69 @@ import bmesh
 from mathutils import Vector
 
 
+# Meshy 的 24 骨骼人形骨架到 UE 常用核心命名。这里只改名，不改变层级、参考姿势或骨骼数量。
+UE_BONE_NAMES = {
+    "Hips": "pelvis",
+    "LeftUpLeg": "thigh_l",
+    "LeftLeg": "calf_l",
+    "LeftFoot": "foot_l",
+    "LeftToeBase": "ball_l",
+    "RightUpLeg": "thigh_r",
+    "RightLeg": "calf_r",
+    "RightFoot": "foot_r",
+    "RightToeBase": "ball_r",
+    "Spine02": "spine_01",
+    "Spine01": "spine_02",
+    "Spine": "spine_03",
+    "LeftShoulder": "clavicle_l",
+    "LeftArm": "upperarm_l",
+    "LeftForeArm": "lowerarm_l",
+    "LeftHand": "hand_l",
+    "RightShoulder": "clavicle_r",
+    "RightArm": "upperarm_r",
+    "RightForeArm": "lowerarm_r",
+    "RightHand": "hand_r",
+    "neck": "neck_01",
+    "Head": "head",
+    "headfront": "head_front",
+}
+
+
+def rename_bones_for_ue(armatures, meshes):
+    """同步改名骨骼、蒙皮组和动画曲线路径；缺少的骨骼保持缺少。"""
+    existing = {bone.name for armature in armatures for bone in armature.data.bones}
+    renames = {source: target for source, target in UE_BONE_NAMES.items() if source in existing}
+    collisions = sorted(target for source, target in renames.items() if target in existing and target != source)
+    if collisions:
+        raise RuntimeError(f"UE bone rename collision: {', '.join(collisions)}")
+
+    for armature in armatures:
+        for source, target in renames.items():
+            bone = armature.data.bones.get(source)
+            if bone:
+                bone.name = target
+
+    # Blender 通常会随骨骼自动更新同名蒙皮组；这里仅处理没有自动同步的导入格式。
+    for mesh in meshes:
+        for source, target in renames.items():
+            group = mesh.vertex_groups.get(source)
+            if group and not mesh.vertex_groups.get(target):
+                group.name = target
+
+    for action in bpy.data.actions:
+        for curve in action.fcurves:
+            for source, target in renames.items():
+                curve.data_path = curve.data_path.replace(
+                    f'pose.bones["{source}"]', f'pose.bones["{target}"]'
+                )
+
+    final_names = {bone.name for armature in armatures for bone in armature.data.bones}
+    missing = sorted(target for target in renames.values() if target not in final_names)
+    if missing:
+        raise RuntimeError(f"UE bone rename failed: {', '.join(missing)}")
+    return renames
+
+
 def args_after_separator():
     values = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     parser = argparse.ArgumentParser()
@@ -105,6 +168,7 @@ def main():
     if not meshes:
         raise RuntimeError("no mesh objects found")
 
+    bone_renames = rename_bones_for_ue(armatures, meshes)
     deform_names = {bone.name for armature in armatures for bone in armature.data.bones if bone.use_deform}
     # 高度必须由真正参与蒙皮的角色网格决定；生成服务可能附带未绑定的 Icosphere 等辅助物。
     height_meshes = [
@@ -274,6 +338,8 @@ def main():
             "triangles": triangles,
             "meshObjects": len(meshes),
             "bones": sum(len(obj.data.bones) for obj in armatures),
+            "boneNames": [bone.name for obj in armatures for bone in obj.data.bones],
+            "boneRenames": bone_renames,
             "materials": len(materials),
             "textures": len(images),
             "animations": len(actions),
@@ -296,6 +362,7 @@ def main():
             "unit": "meter",
             "maxBoneInfluences": 4,
             "automaticWeightNormalization": True,
+            "boneNamingProfile": "ue5-core",
         },
         "warnings": warnings,
     }

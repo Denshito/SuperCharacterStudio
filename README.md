@@ -79,7 +79,7 @@ TACharacterStudio/
 | `validation.json` | 单次 Blender 质量审计证据 | 仅对应当次输出 |
 | `ue-import-report.json` | UE 资产路径、导入设置、Bounds、Idle/Walk 结果 | 仅对应当次导入 |
 
-配套文档：美术人员从 [ARTIST_GUIDE](docs/ARTIST_GUIDE.md) 开始；版本验收使用 [MANUAL_ACCEPTANCE](docs/MANUAL_ACCEPTANCE.md)；异常处理查看 [TROUBLESHOOTING](docs/TROUBLESHOOTING.md)；后续开发边界见 [PROJECT_STATUS_AND_ROADMAP](PROJECT_STATUS_AND_ROADMAP.md)。
+配套文档：项目过程、工具选择、问题与验证证据见 [DEVELOPMENT_RECORD](docs/DEVELOPMENT_RECORD.md)；美术人员从 [ARTIST_GUIDE](docs/ARTIST_GUIDE.md) 开始；版本验收使用 [MANUAL_ACCEPTANCE](docs/MANUAL_ACCEPTANCE.md)；异常处理查看 [TROUBLESHOOTING](docs/TROUBLESHOOTING.md)；后续开发边界见 [PROJECT_STATUS_AND_ROADMAP](PROJECT_STATUS_AND_ROADMAP.md)。
 
 ## 已实现能力
 
@@ -108,7 +108,8 @@ TACharacterStudio/
 
 ### Blender 与 Unreal Engine
 
-- Normalize 统一米制单位、角色高度、原点、轴向、对象命名和 FBX 平滑信息。它保留来源面绕序与自定义法线，不再对拆分网格岛执行破坏性的全模型法线重算。
+- Remesh 节点可在运行前设置 100–300,000 的目标面数，默认 100,000；参数写入 Manifest 和输入签名，修改后下游结果会标记为需要更新。
+- Normalize 统一米制单位、角色高度、原点、轴向、对象命名和 FBX 平滑信息，并把 Meshy 已有的 24 根人形骨骼改为 UE 常用核心命名；不新增 Root、Twist、IK 或手指骨骼。它保留来源面绕序与自定义法线，不再对拆分网格岛执行破坏性的全模型法线重算。
 - Root/Pelvis 校正为可配置参数，不写死当前角色。
 - Normalize 会把 Rigging 返回的 Walking GLB 独立转换为 `normalized-walk.fbx`；该文件与主角色使用同一规格且不会触发 Meshy 请求。
 - UE Import 使用 `/Game/Generated/<runId>/` 稳定路径创建或更新 Skeletal Mesh、Skeleton、Idle、Walk、材质、纹理和 Preview Map；Idle 与 Walk 复用同一个 Skeleton。

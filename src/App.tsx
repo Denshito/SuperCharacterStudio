@@ -88,6 +88,7 @@ function App() {
   const [uePath, setUePath] = useState("D:\\UE\\UE_5.4\\Engine\\Binaries\\Win64\\UnrealEditor-Cmd.exe");
   const [ueProject, setUeProject] = useState("E:\\AIEval\\Eval_Commiting\\Eval_Commiting.uproject");
   const [targetHeight, setTargetHeight] = useState(1.6);
+  const [targetPolycount, setTargetPolycount] = useState(100000);
   const [rootCorrection, setRootCorrection] = useState("0,0,0");
   const [pelvisCorrection, setPelvisCorrection] = useState("0,0,0");
   const [imagePreset, setImagePreset] = useState("turnaround");
@@ -159,6 +160,9 @@ function App() {
   const acceptProject = useCallback((loaded: LoadedProject) => {
     const parsed = parseManifestV2(loaded.manifest);
     const normalize = (parsed.config as { normalize?: { height_meters?: number; root_correction_degrees?: string; pelvis_correction_degrees?: string } } | undefined)?.normalize;
+    const remeshConfig = (parsed.config as { remesh?: { target_polycount?: number } } | undefined)?.remesh;
+    const savedPolycount = remeshConfig?.target_polycount;
+    if (Number.isInteger(savedPolycount) && savedPolycount !== undefined) setTargetPolycount(savedPolycount);
     if (normalize?.height_meters) setTargetHeight(normalize.height_meters);
     if (normalize?.root_correction_degrees) setRootCorrection(normalize.root_correction_degrees);
     if (normalize?.pelvis_correction_degrees) setPelvisCorrection(normalize.pelvis_correction_degrees);
@@ -425,12 +429,16 @@ function App() {
     // 确认只对本次 IPC 调用有效；Key 由 Rust 放入 sidecar 环境变量，不进入命令行或 Manifest。
     if (runningStage) return;
     if (stage === "reference-approval") { await approveReferenceSelection(); return; }
+    if (stage === "remesh" && (!Number.isInteger(targetPolycount) || targetPolycount < 100 || targetPolycount > 300000)) {
+      setMessage("Remesh 目标面数必须是 100 到 300,000 之间的整数。");
+      return;
+    }
     let confirmed = false;
     const inputArtifactId = stage ? edges.find((edge) => edge.target === stage && edge.source.startsWith("imported:"))?.source : undefined;
     if (operation === "execute" && stage && paidStages.includes(stage) && !mockMode) {
       const configKey = stage === "comfy-prep" ? "comfy" : stage;
       const savedParameters = (manifest as { config?: Record<string, unknown> } | undefined)?.config?.[configKey] ?? {};
-      const parameters = JSON.stringify(stage === "comfy-prep" ? { ...(savedParameters as object), preset: comfyPreset, promptExtra: comfyPrompt } : savedParameters, null, 2);
+      const parameters = JSON.stringify(stage === "comfy-prep" ? { ...(savedParameters as object), preset: comfyPreset, promptExtra: comfyPrompt } : stage === "remesh" ? { ...(savedParameters as object), target_polycount: targetPolycount } : savedParameters, null, 2);
       const cost = stage === "image-turnaround" ? `OpenAI GPT Image 2 · ${imageQuality === "low" ? "低质量草稿，预计约 $0.02–$0.10" : "中质量，预计约 $0.05–$0.25"}（含参考图输入后以实际用量为准）` : stage === "comfy-prep" ? "ComfyUI 将调用 OpenRouter GPT-5.4 Image 2 · Low · 21:9；费用以 OpenRouter 实际记录为准，提交后不会自动重试" : `预计最多消耗约 ${creditEstimate[stage]} Meshy credits`;
       confirmed = await confirmDialog(`${stageLabels[stage]} 将检查输入与参数。完全一致时复用已有结果；输入或参数变化时可能创建新的付费请求。\n${cost}。\n\n参数：\n${parameters}\n\n确认后才允许发送 POST 请求。`, {
         title: "确认付费请求",
@@ -453,6 +461,7 @@ function App() {
         uePath,
         ueProject,
         targetHeight,
+        targetPolycount,
         rootCorrection,
         pelvisCorrection,
         referenceFrontId: null,
@@ -672,6 +681,11 @@ function App() {
           {actionStage === "reference-approval" && <section className="task-controls">
             <h3>采用视图</h3><small>正面和背面为必需，可采用 AI 切分图或原图。</small>
             {[{ label: "正面", value: approvalFront, set: setApprovalFront }, { label: "侧面", value: approvalSide, set: setApprovalSide }, { label: "背面", value: approvalBack, set: setApprovalBack }].map((choice) => <label className="reference-choice" key={choice.label}><span>{choice.label}</span><select value={choice.value} onChange={(event) => choice.set(event.target.value)}><option value="">{choice.label === "侧面" ? "不采用" : "请选择"}</option>{imageCandidates.map((item) => <option key={item.id} value={item.id}>{item.stage === "reference-source" ? "原图" : "切分"} · {item.fileName}</option>)}</select></label>)}
+          </section>}
+          {actionStage === "remesh" && <section className="task-controls">
+            <h3>减面设置</h3>
+            <label className="field-label">目标面数</label><input className="key-input" type="number" min="100" max="300000" step="1000" value={targetPolycount} onChange={(event) => setTargetPolycount(Number(event.target.value))} />
+            <small>允许 100–300,000；实际结果可能因模型结构略有偏差。</small>
           </section>}
           {stageIds.includes("normalize") && <section className="task-controls">
             <h3>交付规格</h3>

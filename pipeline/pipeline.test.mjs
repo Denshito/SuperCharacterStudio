@@ -312,18 +312,22 @@ test("runs remesh from an approved local GLB without a generation output", async
     taskId: null,
     outputs: [],
   };
+  manifest.stages.rigging.status = "SUCCEEDED";
   await writeFile(manifestPath, JSON.stringify(manifest));
   await writeFile(modelPath, Buffer.from("local-glb"));
   try {
     process.env.TA_PIPELINE_MOCK = "1";
-    await executeStage(manifestPath, "remesh", { inputArtifact: modelPath });
-    await executeStage(manifestPath, "remesh", { inputArtifact: modelPath });
+    await executeStage(manifestPath, "remesh", { inputArtifact: modelPath, remesh: { target_polycount: 200000 } });
+    await executeStage(manifestPath, "remesh", { inputArtifact: modelPath, remesh: { target_polycount: 200000 } });
     const reused = JSON.parse(await readFile(manifestPath, "utf8"));
     assert.equal(reused.stages.remesh.status, "SUCCEEDED");
     assert.equal(reused.stages.remesh.taskId, "mock-remesh-task");
     assert.equal(reused.stages.remesh.previousAttempts, undefined);
+    assert.equal(reused.config.remesh.target_polycount, 200000);
+    assert.equal(reused.stages.rigging.status, "STALE");
+    await assert.rejects(() => executeStage(manifestPath, "remesh", { inputArtifact: modelPath, remesh: { target_polycount: 300001 } }), /100.*300,000/);
     await writeFile(modelPath, Buffer.from("changed-local-glb"));
-    await executeStage(manifestPath, "remesh", { inputArtifact: modelPath });
+    await executeStage(manifestPath, "remesh", { inputArtifact: modelPath, remesh: { target_polycount: 200000 } });
     const replaced = JSON.parse(await readFile(manifestPath, "utf8"));
     assert.equal(replaced.stages.remesh.previousAttempts.length, 1);
   } finally {

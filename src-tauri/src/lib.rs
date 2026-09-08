@@ -158,14 +158,27 @@ const PROFILE_FORMAT: &str = "ta-character-studio-profile";
 const MAX_PACKAGE_FILES: usize = 10_000;
 const MAX_PACKAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-fn collect_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
-    for entry in fs::read_dir(directory).map_err(|error| format!("无法读取工程目录：{error}"))? {
-        let path = entry.map_err(|error| format!("无法读取工程文件：{error}"))?.path();
+fn collect_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(PathBuf, String)>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| format!("无法读取工程目录：{error}"))?
+    {
+        let path = entry
+            .map_err(|error| format!("无法读取工程文件：{error}"))?
+            .path();
         if path.is_dir() {
             collect_files(root, &path, files)?;
         } else if path.is_file() {
-            let relative = path.strip_prefix(root).map_err(|_| "工程文件不在工程目录中")?;
-            let name = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| "工程文件不在工程目录中")?;
+            let name = relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             files.push((path, name));
         }
     }
@@ -174,21 +187,37 @@ fn collect_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String
 
 fn validate_archive_path(name: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(name);
-    if path.is_absolute() || path.components().any(|part| !matches!(part, Component::Normal(_))) {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
         return Err(format!("工程包包含不安全路径：{name}"));
     }
     Ok(path)
 }
 
 fn portable_config(raw: &serde_json::Value) -> serde_json::Value {
-    const KEYS: &[&str] = &["image_turnaround", "view_split", "generation", "remesh", "rigging", "animation", "normalize", "ue_import", "comfy"];
+    const KEYS: &[&str] = &[
+        "image_turnaround",
+        "view_split",
+        "generation",
+        "remesh",
+        "rigging",
+        "animation",
+        "normalize",
+        "ue_import",
+        "comfy",
+    ];
     let mut result = serde_json::Map::new();
     if let Some(config) = raw.get("config").and_then(serde_json::Value::as_object) {
         for key in KEYS {
             if let Some(value) = config.get(*key) {
                 let mut value = value.clone();
                 if *key == "comfy" {
-                    value.as_object_mut().map(|object| object.remove("base_url"));
+                    value
+                        .as_object_mut()
+                        .map(|object| object.remove("base_url"));
                 }
                 result.insert((*key).into(), value);
             }
@@ -365,13 +394,27 @@ fn export_project_package(
     let manifest_path = selected_manifest(&selected)?;
     let run_dir = manifest_path.parent().ok_or("Manifest 没有有效目录")?;
     let raw: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(&manifest_path).map_err(|error| format!("无法读取 Manifest：{error}"))?,
-    ).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
-    let run_id = raw.get("runId").and_then(serde_json::Value::as_str).filter(|value| valid_run_name(value)).ok_or("Manifest 缺少有效 runId")?;
-    let Some(target) = app.dialog().file().add_filter("TA Character 工程包", &["zip"]).set_file_name(format!("{run_id}.tacs-project.zip")).blocking_save_file() else {
+        &fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("无法读取 Manifest：{error}"))?,
+    )
+    .map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
+    let run_id = raw
+        .get("runId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| valid_run_name(value))
+        .ok_or("Manifest 缺少有效 runId")?;
+    let Some(target) = app
+        .dialog()
+        .file()
+        .add_filter("TA Character 工程包", &["zip"])
+        .set_file_name(format!("{run_id}.tacs-project.zip"))
+        .blocking_save_file()
+    else {
         return Ok(None);
     };
-    let target = target.into_path().map_err(|error| format!("导出路径无效：{error}"))?;
+    let target = target
+        .into_path()
+        .map_err(|error| format!("导出路径无效：{error}"))?;
     if target.starts_with(run_dir) {
         return Err("工程包不能保存到正在打包的工程目录中".into());
     }
@@ -381,25 +424,46 @@ fn export_project_package(
     if files.len() > MAX_PACKAGE_FILES {
         return Err("工程文件数量超过安全上限".into());
     }
-    let archive_file = fs::File::create(&target).map_err(|error| format!("无法创建工程包：{error}"))?;
+    let archive_file =
+        fs::File::create(&target).map_err(|error| format!("无法创建工程包：{error}"))?;
     let mut archive = zip::ZipWriter::new(archive_file);
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     let package = PortablePackage {
         format: PACKAGE_FORMAT.into(),
         version: 1,
         run_id: run_id.into(),
         manifest: format!("output/{run_id}/manifest.json"),
     };
-    archive.start_file("package.json", options).map_err(|error| format!("无法写入工程包：{error}"))?;
-    archive.write_all(&serde_json::to_vec_pretty(&package).map_err(|error| format!("无法编码工程包信息：{error}"))?).map_err(|error| format!("无法写入工程包信息：{error}"))?;
+    archive
+        .start_file("package.json", options)
+        .map_err(|error| format!("无法写入工程包：{error}"))?;
+    archive
+        .write_all(
+            &serde_json::to_vec_pretty(&package)
+                .map_err(|error| format!("无法编码工程包信息：{error}"))?,
+        )
+        .map_err(|error| format!("无法写入工程包信息：{error}"))?;
     for (path, relative) in files {
-        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_lowercase();
-        if file_name == ".env" || file_name.starts_with(".env.") || file_name.ends_with(".log") { continue; }
-        archive.start_file(format!("output/{run_id}/{relative}"), options).map_err(|error| format!("无法写入工程文件：{error}"))?;
-        let mut source = fs::File::open(&path).map_err(|error| format!("无法读取工程文件：{error}"))?;
-        std::io::copy(&mut source, &mut archive).map_err(|error| format!("无法复制工程文件：{error}"))?;
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if file_name == ".env" || file_name.starts_with(".env.") || file_name.ends_with(".log") {
+            continue;
+        }
+        archive
+            .start_file(format!("output/{run_id}/{relative}"), options)
+            .map_err(|error| format!("无法写入工程文件：{error}"))?;
+        let mut source =
+            fs::File::open(&path).map_err(|error| format!("无法读取工程文件：{error}"))?;
+        std::io::copy(&mut source, &mut archive)
+            .map_err(|error| format!("无法复制工程文件：{error}"))?;
     }
-    archive.finish().map_err(|error| format!("无法完成工程包：{error}"))?;
+    archive
+        .finish()
+        .map_err(|error| format!("无法完成工程包：{error}"))?;
     Ok(Some(target.to_string_lossy().into_owned()))
 }
 
@@ -409,25 +473,44 @@ fn import_project_package(
     session: State<ProjectSession>,
     selected: State<SelectedManifest>,
 ) -> Result<Option<LoadedProject>, String> {
-    let Some(source) = app.dialog().file().add_filter("TA Character 工程包", &["zip"]).blocking_pick_file() else {
+    let Some(source) = app
+        .dialog()
+        .file()
+        .add_filter("TA Character 工程包", &["zip"])
+        .blocking_pick_file()
+    else {
         return Ok(None);
     };
-    let source = source.into_path().map_err(|error| format!("工程包路径无效：{error}"))?;
+    let source = source
+        .into_path()
+        .map_err(|error| format!("工程包路径无效：{error}"))?;
     let Some(destination) = app.dialog().file().blocking_pick_folder() else {
         return Ok(None);
     };
-    let destination = destination.into_path().map_err(|error| format!("导入目录无效：{error}"))?.canonicalize().map_err(|error| format!("无法验证导入目录：{error}"))?;
-    let mut archive = zip::ZipArchive::new(fs::File::open(&source).map_err(|error| format!("无法打开工程包：{error}"))?).map_err(|error| format!("工程包不是有效 ZIP：{error}"))?;
+    let destination = destination
+        .into_path()
+        .map_err(|error| format!("导入目录无效：{error}"))?
+        .canonicalize()
+        .map_err(|error| format!("无法验证导入目录：{error}"))?;
+    let mut archive = zip::ZipArchive::new(
+        fs::File::open(&source).map_err(|error| format!("无法打开工程包：{error}"))?,
+    )
+    .map_err(|error| format!("工程包不是有效 ZIP：{error}"))?;
     if archive.len() > MAX_PACKAGE_FILES {
         return Err("工程包文件数量超过安全上限".into());
     }
     let package: PortablePackage = {
-        let mut entry = archive.by_name("package.json").map_err(|_| "工程包缺少 package.json")?;
+        let mut entry = archive
+            .by_name("package.json")
+            .map_err(|_| "工程包缺少 package.json")?;
         let mut text = String::new();
-        entry.read_to_string(&mut text).map_err(|error| format!("无法读取工程包信息：{error}"))?;
+        entry
+            .read_to_string(&mut text)
+            .map_err(|error| format!("无法读取工程包信息：{error}"))?;
         serde_json::from_str(&text).map_err(|error| format!("工程包信息无效：{error}"))?
     };
-    if package.format != PACKAGE_FORMAT || package.version != 1 || !valid_run_name(&package.run_id) {
+    if package.format != PACKAGE_FORMAT || package.version != 1 || !valid_run_name(&package.run_id)
+    {
         return Err("不支持的工程包格式或版本".into());
     }
     let expected_manifest = format!("output/{}/manifest.json", package.run_id);
@@ -435,23 +518,37 @@ fn import_project_package(
         return Err("工程包 Manifest 位置无效".into());
     }
     {
-        let mut entry = archive.by_name(&expected_manifest).map_err(|_| "工程包缺少 manifest.json")?;
-        if entry.size() > 16 * 1024 * 1024 { return Err("Manifest 超过安全上限".into()); }
+        let mut entry = archive
+            .by_name(&expected_manifest)
+            .map_err(|_| "工程包缺少 manifest.json")?;
+        if entry.size() > 16 * 1024 * 1024 {
+            return Err("Manifest 超过安全上限".into());
+        }
         let mut text = String::new();
-        entry.read_to_string(&mut text).map_err(|error| format!("无法读取 Manifest：{error}"))?;
-        let manifest: Manifest = serde_json::from_str(&text).map_err(|error| format!("Manifest 结构无效：{error}"))?;
-        if manifest.version != 2 || manifest.run_id != package.run_id { return Err("工程包与 Manifest 的版本或 runId 不一致".into()); }
+        entry
+            .read_to_string(&mut text)
+            .map_err(|error| format!("无法读取 Manifest：{error}"))?;
+        let manifest: Manifest =
+            serde_json::from_str(&text).map_err(|error| format!("Manifest 结构无效：{error}"))?;
+        if manifest.version != 2 || manifest.run_id != package.run_id {
+            return Err("工程包与 Manifest 的版本或 runId 不一致".into());
+        }
     }
     let prefix = format!("output/{}/", package.run_id);
     let mut total = 0u64;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(|error| format!("无法检查工程包：{error}"))?;
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| format!("无法检查工程包：{error}"))?;
         let name = entry.name();
         validate_archive_path(name)?;
         if name != "package.json" && !name.starts_with(&prefix) {
             return Err(format!("工程包包含范围外文件：{name}"));
         }
-        if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
             return Err("工程包不能包含符号链接".into());
         }
         total = total.checked_add(entry.size()).ok_or("工程包大小溢出")?;
@@ -463,21 +560,37 @@ fn import_project_package(
     if target_run.exists() {
         return Err(format!("目标工程已存在：{}", target_run.display()));
     }
-    fs::create_dir_all(destination.join("output")).map_err(|error| format!("无法创建导入目录：{error}"))?;
-    let output_root = destination.join("output").canonicalize().map_err(|error| format!("无法验证导入目录：{error}"))?;
-    if !output_root.starts_with(&destination) { return Err("导入目录包含指向范围外的链接".into()); }
+    fs::create_dir_all(destination.join("output"))
+        .map_err(|error| format!("无法创建导入目录：{error}"))?;
+    let output_root = destination
+        .join("output")
+        .canonicalize()
+        .map_err(|error| format!("无法验证导入目录：{error}"))?;
+    if !output_root.starts_with(&destination) {
+        return Err("导入目录包含指向范围外的链接".into());
+    }
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|error| format!("无法读取工程包：{error}"))?;
-        if entry.name() == "package.json" || entry.is_dir() { continue; }
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("无法读取工程包：{error}"))?;
+        if entry.name() == "package.json" || entry.is_dir() {
+            continue;
+        }
         let relative = validate_archive_path(entry.name())?;
         let target = destination.join(relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("无法创建导入目录：{error}"))?;
-            let verified = parent.canonicalize().map_err(|error| format!("无法验证导入目录：{error}"))?;
-            if !verified.starts_with(&output_root) { return Err("工程包试图写入目标工程范围外".into()); }
+            let verified = parent
+                .canonicalize()
+                .map_err(|error| format!("无法验证导入目录：{error}"))?;
+            if !verified.starts_with(&output_root) {
+                return Err("工程包试图写入目标工程范围外".into());
+            }
         }
-        let mut output = fs::File::create(&target).map_err(|error| format!("无法创建导入文件：{error}"))?;
-        std::io::copy(&mut entry, &mut output).map_err(|error| format!("无法解压工程文件：{error}"))?;
+        let mut output =
+            fs::File::create(&target).map_err(|error| format!("无法创建导入文件：{error}"))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|error| format!("无法解压工程文件：{error}"))?;
     }
     let manifest_path = destination.join(package.manifest);
     let project = load_manifest(&manifest_path, &session)?;
@@ -486,52 +599,127 @@ fn import_project_package(
 }
 
 #[tauri::command]
-fn export_profile(app: tauri::AppHandle, selected: State<SelectedManifest>) -> Result<Option<String>, String> {
+fn export_profile(
+    app: tauri::AppHandle,
+    selected: State<SelectedManifest>,
+) -> Result<Option<String>, String> {
     let path = selected_manifest(&selected)?;
-    let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).map_err(|error| format!("无法读取 Manifest：{error}"))?).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
+    let raw: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(path).map_err(|error| format!("无法读取 Manifest：{error}"))?,
+    )
+    .map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
     let profile = serde_json::json!({ "format": PROFILE_FORMAT, "version": 1, "config": portable_config(&raw) });
-    let Some(target) = app.dialog().file().add_filter("TA Character 流程配置", &["json"]).set_file_name("TACharacterStudio.tacs-profile.json").blocking_save_file() else { return Ok(None); };
-    let target = target.into_path().map_err(|error| format!("配置路径无效：{error}"))?;
-    fs::write(&target, serde_json::to_vec_pretty(&profile).map_err(|error| format!("无法编码配置：{error}"))?).map_err(|error| format!("无法导出配置：{error}"))?;
+    let Some(target) = app
+        .dialog()
+        .file()
+        .add_filter("TA Character 流程配置", &["json"])
+        .set_file_name("TACharacterStudio.tacs-profile.json")
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let target = target
+        .into_path()
+        .map_err(|error| format!("配置路径无效：{error}"))?;
+    fs::write(
+        &target,
+        serde_json::to_vec_pretty(&profile).map_err(|error| format!("无法编码配置：{error}"))?,
+    )
+    .map_err(|error| format!("无法导出配置：{error}"))?;
     Ok(Some(target.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
-fn import_profile(app: tauri::AppHandle, selected: State<SelectedManifest>) -> Result<bool, String> {
-    let Some(source) = app.dialog().file().add_filter("TA Character 流程配置", &["json"]).blocking_pick_file() else { return Ok(false); };
-    let source = source.into_path().map_err(|error| format!("配置路径无效：{error}"))?;
-    let profile: serde_json::Value = serde_json::from_str(&fs::read_to_string(source).map_err(|error| format!("无法读取配置：{error}"))?).map_err(|error| format!("配置 JSON 已损坏：{error}"))?;
-    if profile.get("format").and_then(serde_json::Value::as_str) != Some(PROFILE_FORMAT) || profile.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+fn import_profile(
+    app: tauri::AppHandle,
+    selected: State<SelectedManifest>,
+) -> Result<bool, String> {
+    let Some(source) = app
+        .dialog()
+        .file()
+        .add_filter("TA Character 流程配置", &["json"])
+        .blocking_pick_file()
+    else {
+        return Ok(false);
+    };
+    let source = source
+        .into_path()
+        .map_err(|error| format!("配置路径无效：{error}"))?;
+    let profile: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(source).map_err(|error| format!("无法读取配置：{error}"))?,
+    )
+    .map_err(|error| format!("配置 JSON 已损坏：{error}"))?;
+    if profile.get("format").and_then(serde_json::Value::as_str) != Some(PROFILE_FORMAT)
+        || profile.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+    {
         return Err("不支持的流程配置格式或版本".into());
     }
-    let config = profile.get("config").and_then(serde_json::Value::as_object).ok_or("流程配置缺少 config")?;
+    let config = profile
+        .get("config")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("流程配置缺少 config")?;
     let path = selected_manifest(&selected)?;
-    let mut manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|error| format!("无法读取 Manifest：{error}"))?).map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&path).map_err(|error| format!("无法读取 Manifest：{error}"))?,
+    )
+    .map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
     let old_comfy_url = manifest.pointer("/config/comfy/base_url").cloned();
     manifest["config"] = serde_json::Value::Object(config.clone());
-    if let Some(url) = old_comfy_url { manifest["config"]["comfy"]["base_url"] = url; }
-    if let Some(stages) = manifest.get_mut("stages").and_then(serde_json::Value::as_object_mut) {
+    if let Some(url) = old_comfy_url {
+        manifest["config"]["comfy"]["base_url"] = url;
+    }
+    if let Some(stages) = manifest
+        .get_mut("stages")
+        .and_then(serde_json::Value::as_object_mut)
+    {
         for (name, stage) in stages {
-            if name != "reference-source" && stage.get("status").and_then(serde_json::Value::as_str) != Some("NOT_STARTED") {
+            if name != "reference-source"
+                && stage.get("status").and_then(serde_json::Value::as_str) != Some("NOT_STARTED")
+            {
                 stage["status"] = "STALE".into();
             }
         }
     }
-    fs::write(path, serde_json::to_vec_pretty(&manifest).map_err(|error| format!("无法编码 Manifest：{error}"))?).map_err(|error| format!("无法应用流程配置：{error}"))?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("无法编码 Manifest：{error}"))?,
+    )
+    .map_err(|error| format!("无法应用流程配置：{error}"))?;
     Ok(true)
 }
 
 #[tauri::command]
 fn install_comfy_nodes(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let bundled = app.path().resource_dir().map_err(|error| format!("无法定位应用资源：{error}"))?.join("integrations/comfy/ComfyUI-TACharacterTools");
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("无法定位应用资源：{error}"))?
+        .join("integrations/comfy/ComfyUI-TACharacterTools");
     #[cfg(debug_assertions)]
-    let source = if bundled.is_dir() { bundled } else { Path::new(env!("CARGO_MANIFEST_DIR")).join("../integrations/comfy/ComfyUI-TACharacterTools") };
+    let source = if bundled.is_dir() {
+        bundled
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../integrations/comfy/ComfyUI-TACharacterTools")
+    };
     #[cfg(not(debug_assertions))]
     let source = bundled;
-    if !source.join("ta_nodes.py").is_file() { return Err("安装包缺少 ComfyUI TA 节点资源".into()); }
-    let Some(folder) = app.dialog().file().blocking_pick_folder() else { return Ok(None); };
-    let custom_nodes = folder.into_path().map_err(|error| format!("ComfyUI 节点目录无效：{error}"))?;
-    if !custom_nodes.is_dir() || custom_nodes.file_name().and_then(|value| value.to_str()).map(|value| !value.eq_ignore_ascii_case("custom_nodes")).unwrap_or(true) {
+    if !source.join("ta_nodes.py").is_file() {
+        return Err("安装包缺少 ComfyUI TA 节点资源".into());
+    }
+    let Some(folder) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let custom_nodes = folder
+        .into_path()
+        .map_err(|error| format!("ComfyUI 节点目录无效：{error}"))?;
+    if !custom_nodes.is_dir()
+        || custom_nodes
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| !value.eq_ignore_ascii_case("custom_nodes"))
+            .unwrap_or(true)
+    {
         return Err("请选择 ComfyUI 的 custom_nodes 文件夹".into());
     }
     let target = custom_nodes.join("ComfyUI-TACharacterTools");
@@ -539,9 +727,13 @@ fn install_comfy_nodes(app: tauri::AppHandle) -> Result<Option<String>, String> 
     let mut files = Vec::new();
     collect_files(&source, &source, &mut files)?;
     for (path, relative) in files {
-        if relative.contains("__pycache__") || relative.ends_with(".pyc") { continue; }
+        if relative.contains("__pycache__") || relative.ends_with(".pyc") {
+            continue;
+        }
         let destination = target.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|error| format!("无法创建节点子目录：{error}"))?; }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("无法创建节点子目录：{error}"))?;
+        }
         fs::copy(path, destination).map_err(|error| format!("无法安装 ComfyUI 节点：{error}"))?;
     }
     Ok(Some(target.to_string_lossy().into_owned()))
@@ -742,14 +934,29 @@ fn set_view_split(
     )
     .map_err(|error| format!("Manifest JSON 已损坏：{error}"))?;
     manifest["config"]["view_split"] = serde_json::json!({ "cuts": cuts, "order": order });
-    for name in ["view-split", "reference-approval", "generation", "remesh", "rigging", "animation", "normalize", "ue-import"] {
+    for name in [
+        "view-split",
+        "reference-approval",
+        "generation",
+        "remesh",
+        "rigging",
+        "animation",
+        "normalize",
+        "ue-import",
+    ] {
         if let Some(stage) = manifest["stages"].get_mut(name) {
             let status = stage["status"].as_str().unwrap_or("NOT_STARTED");
-            if status != "NOT_STARTED" { stage["status"] = "STALE".into(); }
+            if status != "NOT_STARTED" {
+                stage["status"] = "STALE".into();
+            }
         }
     }
-    fs::write(&path, serde_json::to_vec_pretty(&manifest).map_err(|error| format!("无法编码 Manifest：{error}"))?)
-        .map_err(|error| format!("无法保存切分设置：{error}"))
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("无法编码 Manifest：{error}"))?,
+    )
+    .map_err(|error| format!("无法保存切分设置：{error}"))
 }
 
 #[tauri::command]
@@ -853,7 +1060,11 @@ fn import_asset(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_lowercase();
-    if !path.is_file() || !extensions.iter().any(|ext| extension.eq_ignore_ascii_case(ext)) {
+    if !path.is_file()
+        || !extensions
+            .iter()
+            .any(|ext| extension.eq_ignore_ascii_case(ext))
+    {
         return Err(error_label.into());
     }
     let stamp = std::time::SystemTime::now()
@@ -894,7 +1105,15 @@ fn import_mesh(
     session: State<ProjectSession>,
     selected: State<SelectedManifest>,
 ) -> Result<Option<ArtifactInfo>, String> {
-    import_asset(&app, &session, &selected, "GLB 模型", &["glb"], "model.glb", "请选择有效的 GLB 文件")
+    import_asset(
+        &app,
+        &session,
+        &selected,
+        "GLB 模型",
+        &["glb"],
+        "model.glb",
+        "请选择有效的 GLB 文件",
+    )
 }
 
 #[tauri::command]
@@ -903,7 +1122,15 @@ fn import_image(
     session: State<ProjectSession>,
     selected: State<SelectedManifest>,
 ) -> Result<Option<ArtifactInfo>, String> {
-    import_asset(&app, &session, &selected, "角色三视图/参考图", &["png", "jpg", "jpeg"], "turnaround.png", "请选择有效的 PNG 或 JPG 图片")
+    import_asset(
+        &app,
+        &session,
+        &selected,
+        "角色三视图/参考图",
+        &["png", "jpg", "jpeg"],
+        "turnaround.png",
+        "请选择有效的 PNG 或 JPG 图片",
+    )
 }
 
 fn valid_run_name(value: &str) -> bool {
@@ -994,12 +1221,24 @@ fn pipeline_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 fn sidecar_entry(script: &Path) -> Result<(PathBuf, String), String> {
     let directory = script.parent().ok_or("管线脚本没有有效目录")?.to_path_buf();
-    let file_name = script.file_name().and_then(|value| value.to_str()).ok_or("管线脚本文件名无效")?.to_string();
+    let file_name = script
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("管线脚本文件名无效")?
+        .to_string();
     Ok((directory, file_name))
 }
 
 fn is_explicit_spend_confirmation(value: &serde_json::Value) -> bool {
     value.as_bool() == Some(true)
+}
+
+fn validated_target_polycount(value: Option<u32>) -> Result<Option<u32>, String> {
+    match value {
+        Some(value @ 100..=300_000) => Ok(Some(value)),
+        Some(_) => Err("Remesh 目标面数必须在 100 到 300,000 之间".into()),
+        None => Ok(None),
+    }
 }
 
 #[tauri::command]
@@ -1020,6 +1259,7 @@ fn start_pipeline(
     ue_path: Option<String>,
     ue_project: Option<String>,
     target_height: Option<f64>,
+    target_polycount: Option<u32>,
     root_correction: Option<String>,
     pelvis_correction: Option<String>,
     reference_front_id: Option<String>,
@@ -1039,15 +1279,29 @@ fn start_pipeline(
     if process.0.lock().map_err(|_| "管线进程不可用")?.is_some() {
         return Err("已有节点正在运行，请先停止或等待完成".into());
     }
-    if !matches!(operation.as_str(), "init" | "execute" | "resume" | "check" | "check-comfy" | "doctor" | "approve-references") {
+    if !matches!(
+        operation.as_str(),
+        "init" | "execute" | "resume" | "check" | "check-comfy" | "doctor" | "approve-references"
+    ) {
         return Err("不支持的管线操作".into());
     }
-    if !matches!(operation.as_str(), "check" | "check-comfy" | "doctor" | "init" | "approve-references")
-        && !matches!(
-            stage.as_deref(),
-            Some("image-turnaround" | "view-split" | "generation" | "remesh" | "rigging" | "animation" | "normalize" | "ue-import" | "comfy-prep")
+    if !matches!(
+        operation.as_str(),
+        "check" | "check-comfy" | "doctor" | "init" | "approve-references"
+    ) && !matches!(
+        stage.as_deref(),
+        Some(
+            "image-turnaround"
+                | "view-split"
+                | "generation"
+                | "remesh"
+                | "rigging"
+                | "animation"
+                | "normalize"
+                | "ue-import"
+                | "comfy-prep"
         )
-    {
+    ) {
         return Err("请选择可执行的管线阶段".into());
     }
 
@@ -1063,10 +1317,18 @@ fn start_pipeline(
         }
     } else if operation == "doctor" {
         args.push("--json".into());
-        if let Some(url) = comfy_url.filter(|value| !value.trim().is_empty()) { args.extend(["--comfy-url".into(), url]); }
-        if let Some(path) = blender_path.filter(|value| !value.trim().is_empty()) { args.extend(["--tool-path".into(), path]); }
-        if let Some(path) = ue_path.filter(|value| !value.trim().is_empty()) { args.extend(["--ue-path".into(), path]); }
-        if let Some(path) = ue_project.filter(|value| !value.trim().is_empty()) { args.extend(["--ue-project".into(), path]); }
+        if let Some(url) = comfy_url.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--comfy-url".into(), url]);
+        }
+        if let Some(path) = blender_path.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--tool-path".into(), path]);
+        }
+        if let Some(path) = ue_path.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--ue-path".into(), path]);
+        }
+        if let Some(path) = ue_project.filter(|value| !value.trim().is_empty()) {
+            args.extend(["--ue-project".into(), path]);
+        }
     } else if operation == "init" {
         let name = run_name.ok_or("请输入工程名称")?;
         if !valid_run_name(&name) {
@@ -1094,13 +1356,41 @@ fn start_pipeline(
         *selected.0.lock().map_err(|_| "项目会话不可用")? = Some(manifest);
     } else if operation == "approve-references" {
         let manifest = selected_manifest(&selected)?;
-        args.extend(["--manifest".into(), manifest.to_string_lossy().into_owned(), "--json".into()]);
-        for (flag, id, required) in [("--front", reference_front_id, true), ("--side", reference_side_id, false), ("--back", reference_back_id, true)] {
-            let Some(id) = id else { if required { return Err("美术确认至少需要正面图和背面图".into()); } else { continue; } };
+        args.extend([
+            "--manifest".into(),
+            manifest.to_string_lossy().into_owned(),
+            "--json".into(),
+        ]);
+        for (flag, id, required) in [
+            ("--front", reference_front_id, true),
+            ("--side", reference_side_id, false),
+            ("--back", reference_back_id, true),
+        ] {
+            let Some(id) = id else {
+                if required {
+                    return Err("美术确认至少需要正面图和背面图".into());
+                } else {
+                    continue;
+                }
+            };
             let path = approved_path(&app.state::<ProjectSession>(), &id)?;
-            let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_lowercase();
-            if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") { return Err("美术确认只接受已授权的 PNG/JPG 产物".into()); }
-            let stage_token = if let Some((stage, index)) = id.rsplit_once(':') { if index.parse::<usize>().is_ok() { format!("{stage}:{index}") } else { return Err("参考图产物 ID 无效".into()); } } else { return Err("参考图产物 ID 无效".into()); };
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+                return Err("美术确认只接受已授权的 PNG/JPG 产物".into());
+            }
+            let stage_token = if let Some((stage, index)) = id.rsplit_once(':') {
+                if index.parse::<usize>().is_ok() {
+                    format!("{stage}:{index}")
+                } else {
+                    return Err("参考图产物 ID 无效".into());
+                }
+            } else {
+                return Err("参考图产物 ID 无效".into());
+            };
             args.extend([flag.into(), stage_token]);
         }
     } else {
@@ -1159,6 +1449,11 @@ fn start_pipeline(
                 args.extend(["--comfy-prompt".into(), prompt]);
             }
         }
+        if stage_name == "remesh" {
+            if let Some(value) = validated_target_polycount(target_polycount)? {
+                args.extend(["--target-polycount".into(), value.to_string()]);
+            }
+        }
         if stage_name == "normalize" {
             let blender = validated_file(blender_path, "D:/Blender/blender.exe", "blender.exe")?;
             let height = target_height.unwrap_or(1.6);
@@ -1181,14 +1476,25 @@ fn start_pipeline(
             let quality = image_quality.unwrap_or_else(|| "low".into());
             let background = image_background.unwrap_or_else(|| "opaque".into());
             let prompt = image_prompt.unwrap_or_default();
-            if !matches!(preset.as_str(), "turnaround" | "complete-views" | "clean-pose")
-                || !matches!(quality.as_str(), "low" | "medium")
+            if !matches!(
+                preset.as_str(),
+                "turnaround" | "complete-views" | "clean-pose"
+            ) || !matches!(quality.as_str(), "low" | "medium")
                 || !matches!(background.as_str(), "opaque" | "transparent" | "auto")
                 || prompt.len() > 4000
             {
                 return Err("三视图生成参数无效".into());
             }
-            args.extend(["--image-preset".into(), preset, "--image-quality".into(), quality, "--image-background".into(), background, "--image-prompt".into(), prompt]);
+            args.extend([
+                "--image-preset".into(),
+                preset,
+                "--image-quality".into(),
+                quality,
+                "--image-background".into(),
+                background,
+                "--image-prompt".into(),
+                prompt,
+            ]);
         }
         if stage_name == "ue-import" {
             let unreal = validated_file(
@@ -1410,7 +1716,8 @@ mod tests {
 
     #[test]
     fn sidecar_entry_is_safe_for_drive_and_space_paths() {
-        let (directory, entry) = sidecar_entry(Path::new("E:/TA Character Studio/pipeline/pipeline.mjs")).unwrap();
+        let (directory, entry) =
+            sidecar_entry(Path::new("E:/TA Character Studio/pipeline/pipeline.mjs")).unwrap();
         assert_eq!(directory, PathBuf::from("E:/TA Character Studio/pipeline"));
         assert_eq!(entry, "pipeline.mjs");
     }
@@ -1419,15 +1726,37 @@ mod tests {
     fn spend_confirmation_requires_a_json_boolean_true() {
         assert!(is_explicit_spend_confirmation(&serde_json::json!(true)));
         assert!(!is_explicit_spend_confirmation(&serde_json::json!(false)));
-        assert!(!is_explicit_spend_confirmation(&serde_json::json!({ "confirmed": true })));
+        assert!(!is_explicit_spend_confirmation(
+            &serde_json::json!({ "confirmed": true })
+        ));
         assert!(!is_explicit_spend_confirmation(&serde_json::json!("true")));
         assert!(!is_explicit_spend_confirmation(&serde_json::Value::Null));
     }
 
     #[test]
+    fn validates_remesh_target_polycount() {
+        assert_eq!(validated_target_polycount(Some(100)).unwrap(), Some(100));
+        assert_eq!(
+            validated_target_polycount(Some(300_000)).unwrap(),
+            Some(300_000)
+        );
+        assert!(validated_target_polycount(Some(99)).is_err());
+        assert!(validated_target_polycount(Some(300_001)).is_err());
+    }
+
+    #[test]
     fn strips_windows_verbatim_prefix_for_external_tools() {
-        assert_eq!(command_line_path(Path::new(r"\\?\E:\AIEval\Eval.uproject")), r"E:\AIEval\Eval.uproject");
-        assert_eq!(command_line_path(Path::new(r"\\?\UNC\server\share\Eval.uproject")), r"\\server\share\Eval.uproject");
-        assert_eq!(command_line_path(Path::new(r"E:\AIEval\Eval.uproject")), r"E:\AIEval\Eval.uproject");
+        assert_eq!(
+            command_line_path(Path::new(r"\\?\E:\AIEval\Eval.uproject")),
+            r"E:\AIEval\Eval.uproject"
+        );
+        assert_eq!(
+            command_line_path(Path::new(r"\\?\UNC\server\share\Eval.uproject")),
+            r"\\server\share\Eval.uproject"
+        );
+        assert_eq!(
+            command_line_path(Path::new(r"E:\AIEval\Eval.uproject")),
+            r"E:\AIEval\Eval.uproject"
+        );
     }
 }

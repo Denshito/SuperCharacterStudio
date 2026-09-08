@@ -1016,7 +1016,7 @@ async function executeLocalStage(manifestPath, stageName, options) {
     const hasWalk = walkGlbSource && await fs.access(walkGlbSource).then(() => true).catch(() => false);
     if (!hasWalk) walkGlbSource = "";
     signature = { input: await sha256(source), walk: walkGlbSource ? await sha256(walkGlbSource) : null, script: await sha256(script), config };
-    args = ["--background", "--factory-startup", "--python", script, "--", "--input", source, "--output-dir", outputDir, "--height", String(config.height_meters), "--root", config.root_correction_degrees, "--pelvis", config.pelvis_correction_degrees];
+    args = ["--background", "--factory-startup", "--python-exit-code", "1", "--python", script, "--", "--input", source, "--output-dir", outputDir, "--height", String(config.height_meters), "--root", config.root_correction_degrees, "--pelvis", config.pelvis_correction_degrees];
     expected = ["normalized-character.glb", "normalized-character.fbx", "validation.json"];
   } else {
     const script = path.join(ROOT, "tools", "ue_import.py");
@@ -1071,7 +1071,11 @@ async function executeLocalStage(manifestPath, stageName, options) {
       const walkArgs = args.map((item) => item === source ? walkGlbSource : item === outputDir ? walkDir : item);
       await runExternal(executable, walkArgs, environment);
       normalizedWalk = path.join(outputDir, "normalized-walk.fbx");
-      await fs.copyFile(path.join(walkDir, "normalized-character.fbx"), normalizedWalk);
+      const walkFbx = path.join(walkDir, "normalized-character.fbx");
+      if (!await fs.stat(walkFbx).then((item) => item.isFile()).catch(() => false)) {
+        throw new Error(`Walk Normalize 未生成 FBX：${walkFbx}`);
+      }
+      await fs.copyFile(walkFbx, normalizedWalk);
     }
     const reportPath = path.join(outputDir, expected.at(-1));
     const report = JSON.parse(await fs.readFile(reportPath, "utf8"));
@@ -1092,7 +1096,7 @@ async function executeLocalStage(manifestPath, stageName, options) {
   }
 }
 
-export async function executeStage(manifestPath, stageName, { allowSpend = false, resumeOnly = false, inputArtifact, toolPath, ueProject, normalize, imageTurnaround, comfyUrl, comfyPreset, comfyPrompt } = {}) {
+export async function executeStage(manifestPath, stageName, { allowSpend = false, resumeOnly = false, inputArtifact, toolPath, ueProject, remesh, normalize, imageTurnaround, comfyUrl, comfyPreset, comfyPrompt } = {}) {
   if (LOCAL_STAGE_NAMES.includes(stageName)) return executeLocalStage(manifestPath, stageName, { toolPath, ueProject, normalize });
   if (stageName === COMFY_STAGE) {
     const resolved = path.resolve(manifestPath); const manifest = JSON.parse(await fs.readFile(resolved, "utf8")); const currentConfig = JSON.parse(await fs.readFile(path.join(ROOT, "config.json"), "utf8")); upgradeManifest(manifest, currentConfig);
@@ -1110,6 +1114,16 @@ export async function executeStage(manifestPath, stageName, { allowSpend = false
   const runDir = path.dirname(resolvedManifest);
   const storageRoot = rootForManifest(resolvedManifest);
   const { config, stages } = manifest;
+  if (stageName === "remesh" && remesh?.target_polycount !== undefined) {
+    const target = Number(remesh.target_polycount);
+    if (!Number.isInteger(target) || target < 100 || target > 300000) throw new Error("Remesh 目标面数必须是 100 到 300,000 之间的整数。");
+    if (config.remesh.target_polycount !== target) {
+      config.remesh = { ...config.remesh, target_polycount: target };
+      for (const name of ["rigging", "animation", "normalize", "ue-import"]) {
+        if (stages[name] && stages[name].status !== "NOT_STARTED") stages[name].status = "STALE";
+      }
+    }
+  }
   if (stageName === "image-turnaround" && imageTurnaround) config.image_turnaround = { ...config.image_turnaround, ...imageTurnaround };
   if (stageName === "image-turnaround") {
     if (!Object.hasOwn(turnaroundPrompts, config.image_turnaround.preset)) throw new Error("未知的三视图提示预设。");
@@ -1242,6 +1256,7 @@ function usage() {
   node pipeline.mjs doctor [--comfy-url <url>] [--tool-path <blender.exe>] [--ue-path <UnrealEditor-Cmd.exe>] [--ue-project <project.uproject>] --json
   node pipeline.mjs init [--reference <image> ...] --run-name <name> [--output-root <folder>] --json
   node pipeline.mjs execute <stage> --manifest <manifest.json> [--input-artifact <local.glb>] --json [--confirm-spend]
+  node pipeline.mjs execute remesh --manifest <manifest.json> [--target-polycount 100000] --json [--confirm-spend]
   node pipeline.mjs execute comfy-prep --manifest <manifest.json> [--comfy-url <url>] [--comfy-preset <preset>] [--comfy-prompt <extra>] --json
   node pipeline.mjs execute normalize --manifest <manifest.json> [--tool-path <blender.exe>] [--height 1.6] --json
   node pipeline.mjs execute ue-import --manifest <manifest.json> --ue-project <project.uproject> [--tool-path <UnrealEditor-Cmd.exe>] --json
@@ -1272,11 +1287,12 @@ async function main() {
   const height = valueFor("--height");
   const rootCorrection = valueFor("--root-correction");
   const pelvisCorrection = valueFor("--pelvis-correction");
+  const targetPolycount = valueFor("--target-polycount");
   const imagePreset = valueFor("--image-preset"); const imageQuality = valueFor("--image-quality"); const imageBackground = valueFor("--image-background"); const imagePrompt = valueFor("--image-prompt");
   const comfyUrl = valueFor("--comfy-url"); const comfyPreset = valueFor("--comfy-preset"); const comfyPrompt = valueFor("--comfy-prompt");
   const runName = valueFor("--run-name"); const front = valueFor("--front"); const side = valueFor("--side"); const back = valueFor("--back");
   const references = args.flatMap((arg, index) => arg === "--reference" && args[index + 1] ? [args[index + 1]] : []);
-  const valuedFlags = ["--manifest", "--output-root", "--input-artifact", "--tool-path", "--ue-path", "--ue-project", "--height", "--root-correction", "--pelvis-correction", "--run-name", "--front", "--side", "--back", "--reference", "--image-preset", "--image-quality", "--image-background", "--image-prompt", "--comfy-url", "--comfy-preset", "--comfy-prompt"];
+  const valuedFlags = ["--manifest", "--output-root", "--input-artifact", "--tool-path", "--ue-path", "--ue-project", "--height", "--root-correction", "--pelvis-correction", "--target-polycount", "--run-name", "--front", "--side", "--back", "--reference", "--image-preset", "--image-quality", "--image-background", "--image-prompt", "--comfy-url", "--comfy-preset", "--comfy-prompt"];
   const flagsWithValues = new Set(valuedFlags.map((flag) => args.indexOf(flag)).filter((index) => index >= 0).map((index) => index + 1));
   const positional = args.filter((arg, index) => !["--confirm-spend", "--json", "--mock", ...valuedFlags].includes(arg) && !flagsWithValues.has(index));
   const [command, ...values] = positional;
@@ -1296,7 +1312,7 @@ async function main() {
   }
   if (command === "inspect" && manifestPath) return inspectManifest(manifestPath);
   if (command === "approve-references" && manifestPath) return approveReferences(manifestPath, { front, side, back });
-  if (command === "execute" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, inputArtifact, toolPath, ueProject, normalize: { ...(height ? { height_meters: Number(height) } : {}), ...(rootCorrection ? { root_correction_degrees: rootCorrection } : {}), ...(pelvisCorrection ? { pelvis_correction_degrees: pelvisCorrection } : {}) }, imageTurnaround: { ...(imagePreset ? { preset: imagePreset } : {}), ...(imageQuality ? { quality: imageQuality } : {}), ...(imageBackground ? { background: imageBackground } : {}), ...(imagePrompt !== undefined ? { prompt_extra: imagePrompt } : {}) }, comfyUrl, comfyPreset, comfyPrompt });
+  if (command === "execute" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, inputArtifact, toolPath, ueProject, remesh: targetPolycount === undefined ? undefined : { target_polycount: Number(targetPolycount) }, normalize: { ...(height ? { height_meters: Number(height) } : {}), ...(rootCorrection ? { root_correction_degrees: rootCorrection } : {}), ...(pelvisCorrection ? { pelvis_correction_degrees: pelvisCorrection } : {}) }, imageTurnaround: { ...(imagePreset ? { preset: imagePreset } : {}), ...(imageQuality ? { quality: imageQuality } : {}), ...(imageBackground ? { background: imageBackground } : {}), ...(imagePrompt !== undefined ? { prompt_extra: imagePrompt } : {}) }, comfyUrl, comfyPreset, comfyPrompt });
   if (command === "resume" && values[0] && manifestPath) return executeStage(manifestPath, values[0], { allowSpend, resumeOnly: true, inputArtifact });
   if (command === "run" && values.length >= 2) {
     const manifestPath = await createRun(values[0], values[1], values[2]);
